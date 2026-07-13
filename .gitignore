@@ -16,3 +16,7 @@ _retest.sh
 run_*
 tabulated*
 *triangle*
+*.ply
+*.pt
+*.pth
+.env
