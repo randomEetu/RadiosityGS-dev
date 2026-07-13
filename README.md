@@ -19,7 +19,7 @@ conda activate radiosity_gs
 ./install.sh
 ```
 
-## Getting started
+## Getting started (git test modification)
 ### Dataset Preparation
 We currently only support the format as specified in [GS^3](https://github.com/gsrelight/gs-relight) where the location and intensity of point lights are provided, or the standard Blender/COLMAP format where a fixed environment map is assumed.
 
