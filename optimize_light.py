@@ -20,6 +20,7 @@ os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 import sys
 import random
+from time import strftime, localtime
 from argparse import ArgumentParser
 
 import torch
@@ -130,9 +131,21 @@ def main():
                         help="Save a fixed-view render every N epochs (epoch 0 always saved)")
     parser.add_argument("--num_walks", type=int, default=64,
                         help="Monte-Carlo walks for the (hybrid/MC) solver")
-    parser.add_argument("--position_lr", type=float, default=0.01)
+    parser.add_argument("--position_lr", type=float, default=0.005)
     parser.add_argument("--intensity_lr", type=float, default=0.05)
     parser.add_argument("--lambda_dssim", type=float, default=0.2)
+    # Fitting a single point light against a multi-light (OLAT) dataset is
+    # ill-posed. Use --target_view to instead fit ONE image (correct + fast).
+    parser.add_argument("--target_view", type=int, default=-1,
+                        help="If >=0, optimize the light to reproduce a SINGLE train view "
+                             "(index into the train split). This view is also the snapshot "
+                             "camera and gt_reference. Recommended for OLAT/multi-light data.")
+    parser.add_argument("--steps_per_epoch", type=int, default=-1,
+                        help="Gradient steps per epoch. Default: all train views (multi-view), "
+                             "or 50 (single-target mode).")
+    parser.add_argument("--max_light_dist", type=float, default=4.0,
+                        help="Clamp the light within this many object-radii of the center, "
+                             "so it can't run off to infinity.")
     # Fixed camera used for the epoch snapshots.
     parser.add_argument("--view_split", type=str, default="auto", choices=["auto", "train", "test"])
     parser.add_argument("--view_index", type=int, default=0)
@@ -186,6 +199,11 @@ def main():
     print(f"Dataset pl_pos  mean = {pl_positions.mean(0).tolist()}")
     print(f"Dataset pl_pos  std  = {pos_std.tolist()}  "
           f"(near-zero std => a single global light; large std => per-view/OLAT lights)")
+    obj_radius_hint = (gaussians.get_xyz.detach() - gaussians.get_xyz.detach().mean(0)).norm(dim=1).max()
+    if pos_std.max() > 0.1 * obj_radius_hint and args.target_view < 0:
+        print("\n[WARNING] Light position varies a lot across views => this looks like a")
+        print("          MULTI-LIGHT (OLAT) dataset. A single global light cannot fit all")
+        print("          views and will drift. Re-run with --target_view <i> to fit ONE image.\n")
 
     # ---- Randomly initialize the single learnable point light ----
     center = gaussians.get_xyz.detach().mean(dim=0)
@@ -220,17 +238,30 @@ def main():
     }
 
     # ---- Fixed camera for the snapshots ----
-    if args.view_split == "test" or (args.view_split == "auto" and len(test_cams) > 0):
-        fixed_pool = test_cams
-        split_name = "test"
+    # In single-target mode the snapshot view IS the target, so the render should
+    # converge to exactly reproduce gt_reference.png.
+    target_mode = args.target_view >= 0
+    if target_mode:
+        target_idx = args.target_view % len(train_cams)
+        fixed_cam = train_cams[target_idx]
+        split_name = f"train (single-target #{target_idx})"
+        print(f"\nSingle-target mode: fitting the light to train[{target_idx}] "
+              f"(image_name={fixed_cam.image_name})")
     else:
-        fixed_pool = train_cams
-        split_name = "train"
-    fixed_cam = fixed_pool[args.view_index % len(fixed_pool)]
-    print(f"\nFixed snapshot view: {split_name}[{args.view_index % len(fixed_pool)}] "
-          f"(image_name={fixed_cam.image_name})")
+        if args.view_split == "test" or (args.view_split == "auto" and len(test_cams) > 0):
+            fixed_pool = test_cams
+            split_name = "test"
+        else:
+            fixed_pool = train_cams
+            split_name = "train"
+        fixed_cam = fixed_pool[args.view_index % len(fixed_pool)]
+        print(f"\nFixed snapshot view: {split_name}[{args.view_index % len(fixed_pool)}] "
+              f"(image_name={fixed_cam.image_name})")
 
-    out_dir = args.output_dir or os.path.join(args.model_path, "light_optimization")
+    # One timestamped subfolder per run so runs don't overwrite each other.
+    base_dir = args.output_dir or os.path.join(args.model_path, "light_optimization")
+    run_stamp = strftime("%Y-%m-%d_%H-%M-%S", localtime())
+    out_dir = os.path.join(base_dir, run_stamp)
     os.makedirs(out_dir, exist_ok=True)
     print(f"Writing snapshots to: {out_dir}\n")
 
@@ -251,16 +282,36 @@ def main():
         print(f"[epoch {epoch:>3}] saved epoch_{epoch}.png | fixed-view PSNR {p:5.2f} | "
               f"light pos [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}]")
 
+    max_dist = (obj_radius * args.max_light_dist).item()
+
+    def clamp_light():
+        with torch.no_grad():
+            d = point_light._xyz - center  # (1, 3)
+            dist = d.norm()
+            if dist > max_dist:
+                point_light._xyz.copy_(center + d / dist * max_dist)
+
+    # How many gradient steps per epoch, and which views they use.
+    if target_mode:
+        steps = args.steps_per_epoch if args.steps_per_epoch > 0 else 50
+    else:
+        cap = len(train_cams) if args.max_views < 0 else min(args.max_views, len(train_cams))
+        steps = args.steps_per_epoch if args.steps_per_epoch > 0 else cap
+    print(f"{steps} gradient steps/epoch x {args.epochs} epochs "
+          f"= {steps * args.epochs} total steps. Light clamped within {max_dist:.3f} of center.\n")
+
     # Epoch 0 == random light, before any optimization.
     save_snapshot(0)
 
-    n_views = len(train_cams) if args.max_views < 0 else min(args.max_views, len(train_cams))
     for epoch in range(1, args.epochs + 1):
-        order = list(range(len(train_cams)))
-        random.shuffle(order)
-        order = order[:n_views]
+        if target_mode:
+            batch = [target_idx] * steps
+        else:
+            order = list(range(len(train_cams)))
+            random.shuffle(order)
+            batch = order[:steps]
 
-        pbar = tqdm(order, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
+        pbar = tqdm(batch, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
         for idx in pbar:
             cam = train_cams[idx]
             pkg = renderGI(cam, gaussians, point_light, pipe, background,
@@ -278,6 +329,7 @@ def main():
             loss.backward()
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            clamp_light()  # keep the light from running off to infinity
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         if epoch % args.save_interval == 0 or epoch == args.epochs:
