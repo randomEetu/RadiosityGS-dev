@@ -41,9 +41,14 @@ from render import read_cfg
 
 
 def _inv_softplus(y):
-    """Inverse of softplus, so softplus(_inv_softplus(y)) == y for y > 0."""
+    """Inverse of softplus, so softplus(_inv_softplus(y)) == y for y > 0.
+
+    Uses the stable form  y + log(-expm1(-y))  (== log(exp(y) - 1)) so it does
+    NOT overflow for large y: HDR point-light DC coefficients are big (RGB/0.282),
+    and the naive log(expm1(y)) blows up to inf around y > 88 in float32.
+    """
     y = y.clamp_min(1e-6)
-    return torch.log(torch.expm1(y).clamp_min(1e-6))
+    return y + torch.log(-torch.expm1(-y))
 
 
 class LearnablePointLight:
