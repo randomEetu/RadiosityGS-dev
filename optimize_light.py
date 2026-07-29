@@ -36,7 +36,14 @@ from utils.loss_utils import l1_loss, ssim
 from utils.image_utils import psnr
 from utils.general_utils import safe_state
 from utils.render_utils import save_img_u8
+from utils.sh_utils import RGB2SH, SH2RGB
 from render import read_cfg
+
+
+def _inv_softplus(y):
+    """Inverse of softplus, so softplus(_inv_softplus(y)) == y for y > 0."""
+    y = y.clamp_min(1e-6)
+    return torch.log(torch.expm1(y).clamp_min(1e-6))
 
 
 class LearnablePointLight:
@@ -54,8 +61,12 @@ class LearnablePointLight:
         self._device = device
         # (1, 3) world-space position, and (1, 3) SH DC intensity (RGB2SH space,
         # same space as camera.pl_intensity / LightModel._intensity).
+        # Intensity is stored pre-softplus so emission stays strictly positive
+        # with a live gradient everywhere (a plain relu can get stuck at 0 and
+        # never recover, permanently darkening the light).
+        raw_intensity = _inv_softplus(init_intensity_sh.reshape(1, 3).float().to(device))
         self._xyz = nn.Parameter(init_xyz.reshape(1, 3).float().to(device).contiguous())
-        self._intensity = nn.Parameter(init_intensity_sh.reshape(1, 3).float().to(device).contiguous())
+        self._intensity = nn.Parameter(raw_intensity.contiguous())
 
     # --- trainable ---
     @property
@@ -63,9 +74,14 @@ class LearnablePointLight:
         return self._xyz
 
     @property
+    def get_dc(self):
+        """Current emission DC coefficient (1, 3), strictly positive."""
+        return torch.nn.functional.softplus(self._intensity)
+
+    @property
     def get_emissions(self):
         # (1, (deg+1)^2, 3): only the DC band emits; higher bands are zero.
-        dc = torch.relu(self._intensity)[:, None, :]  # (1, 1, 3)
+        dc = self.get_dc[:, None, :]  # (1, 1, 3)
         n_rest = (self.max_sh_degree + 1) ** 2 - 1
         rest = torch.zeros((1, n_rest, 3), dtype=dc.dtype, device=self._device)
         return torch.cat((dc, rest), dim=1)
@@ -151,8 +167,14 @@ def main():
     parser.add_argument("--view_index", type=int, default=0)
     # Random light initialization.
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--init_mode", type=str, default="dataset", choices=["dataset", "sphere"],
+                        help="'dataset' (recommended): random draw from the dataset's light "
+                             "cloud (mean +/- std of pl_pos), so the light starts in a "
+                             "plausible, ILLUMINATING position with live gradients. "
+                             "'sphere': random direction at --init_dist_scale object-radii "
+                             "(can land behind the object => dead gradient => stays dark).")
     parser.add_argument("--init_dist_scale", type=float, default=2.0,
-                        help="Init light distance from object center, in units of the object's radius")
+                        help="[sphere mode] Init light distance from object center, in object-radii")
     parser.add_argument("--random_intensity", action="store_true",
                         help="Also randomize the initial intensity (default: seed it from the dataset mean)")
     parser.add_argument("--init_intensity", type=float, default=1.0,
@@ -208,12 +230,20 @@ def main():
     # ---- Randomly initialize the single learnable point light ----
     center = gaussians.get_xyz.detach().mean(dim=0)
     obj_radius = (gaussians.get_xyz.detach() - center).norm(dim=1).max()
-    direction = torch.randn(3, device="cuda")
-    direction = direction / direction.norm()
-    init_xyz = center + direction * obj_radius * args.init_dist_scale
+
+    if args.init_mode == "dataset":
+        # Draw a random-but-plausible light from where the dataset's lights live.
+        # Guarantees the light starts in front of / illuminating the object, so the
+        # loss has a live gradient. The specific target light is still "forgotten".
+        pos_mean = pl_positions.mean(dim=0)
+        init_xyz = pos_mean + torch.randn(3, device="cuda") * pos_std
+    else:  # sphere
+        direction = torch.randn(3, device="cuda")
+        direction = direction / direction.norm()
+        init_xyz = center + direction * obj_radius * args.init_dist_scale
 
     if args.random_intensity:
-        init_intensity_sh = torch.rand(3, device="cuda") * args.init_intensity * 0.28209479  # RGB2SH C0
+        init_intensity_sh = RGB2SH(torch.rand(3, device="cuda") * args.init_intensity)
     else:
         # Seed intensity from the dataset's average so brightness is well-scaled;
         # only the *position* is "forgotten". Add --random_intensity to forget both.
@@ -221,7 +251,9 @@ def main():
         init_intensity_sh = pl_ints.mean(dim=0)
 
     point_light = LearnablePointLight(gaussians.max_sh_degree, init_xyz, init_intensity_sh)
-    print(f"\nInitial light position:  {point_light._xyz.detach().reshape(3).tolist()}")
+    print(f"\nInit mode: {args.init_mode}")
+    print(f"Initial light position:  {point_light._xyz.detach().reshape(3).tolist()}")
+    print(f"Initial light RGB:       {SH2RGB(point_light.get_dc.detach().reshape(3)).tolist()}")
     print(f"Object center / radius:  {center.tolist()} / {obj_radius.item():.4f}")
 
     optimizer = torch.optim.Adam([
@@ -279,10 +311,15 @@ def main():
                     os.path.join(out_dir, f"epoch_{epoch}.png"))
         p = psnr(img, fixed_gt).mean().item()
         pos = point_light._xyz.detach().reshape(3).tolist()
+        rgb = SH2RGB(point_light.get_dc.detach().reshape(3)).tolist()
         print(f"[epoch {epoch:>3}] saved epoch_{epoch}.png | fixed-view PSNR {p:5.2f} | "
-              f"light pos [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}]")
+              f"light pos [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}] | "
+              f"RGB [{rgb[0]:.2f}, {rgb[1]:.2f}, {rgb[2]:.2f}]")
 
-    max_dist = (obj_radius * args.max_light_dist).item()
+    # Clamp based on the dataset's light cloud so a valid solution is never
+    # clipped; fall back to object-radii if that is somehow smaller.
+    pl_dist_max = (pl_positions - center).norm(dim=1).max().item()
+    max_dist = max(pl_dist_max * 1.5, (obj_radius * args.max_light_dist).item())
 
     def clamp_light():
         with torch.no_grad():
