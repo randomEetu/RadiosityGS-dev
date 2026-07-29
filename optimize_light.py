@@ -40,17 +40,6 @@ from utils.sh_utils import RGB2SH, SH2RGB
 from render import read_cfg
 
 
-def _inv_softplus(y):
-    """Inverse of softplus, so softplus(_inv_softplus(y)) == y for y > 0.
-
-    Uses the stable form  y + log(-expm1(-y))  (== log(exp(y) - 1)) so it does
-    NOT overflow for large y: HDR point-light DC coefficients are big (RGB/0.282),
-    and the naive log(expm1(y)) blows up to inf around y > 88 in float32.
-    """
-    y = y.clamp_min(1e-6)
-    return y + torch.log(-torch.expm1(-y))
-
-
 class LearnablePointLight:
     """A single, global, trainable point light.
 
@@ -66,12 +55,16 @@ class LearnablePointLight:
         self._device = device
         # (1, 3) world-space position, and (1, 3) SH DC intensity (RGB2SH space,
         # same space as camera.pl_intensity / LightModel._intensity).
-        # Intensity is stored pre-softplus so emission stays strictly positive
-        # with a live gradient everywhere (a plain relu can get stuck at 0 and
-        # never recover, permanently darkening the light).
-        raw_intensity = _inv_softplus(init_intensity_sh.reshape(1, 3).float().to(device))
+        #
+        # Intensity is optimized in LOG space (emission = exp(_intensity)) so
+        # Adam takes MULTIPLICATIVE steps. HDR point-light DC coefficients are
+        # ~1e3-1e4; a linear/softplus (additive) parametrization is far too stiff
+        # at that scale, so the optimizer ends up "fixing" brightness by moving
+        # the light's DISTANCE (1/r^2 falloff) instead of its intensity -- which
+        # leaves the light's DIRECTION, and hence the shadows, frozen in place.
+        log_intensity = torch.log(init_intensity_sh.reshape(1, 3).float().to(device).clamp_min(1e-8))
         self._xyz = nn.Parameter(init_xyz.reshape(1, 3).float().to(device).contiguous())
-        self._intensity = nn.Parameter(raw_intensity.contiguous())
+        self._intensity = nn.Parameter(log_intensity.contiguous())
 
     # --- trainable ---
     @property
@@ -81,7 +74,7 @@ class LearnablePointLight:
     @property
     def get_dc(self):
         """Current emission DC coefficient (1, 3), strictly positive."""
-        return torch.nn.functional.softplus(self._intensity)
+        return torch.exp(self._intensity.clamp(-30., 30.))
 
     @property
     def get_emissions(self):
@@ -152,8 +145,9 @@ def main():
                         help="Save a fixed-view render every N epochs (epoch 0 always saved)")
     parser.add_argument("--num_walks", type=int, default=64,
                         help="Monte-Carlo walks for the (hybrid/MC) solver")
-    parser.add_argument("--position_lr", type=float, default=0.005)
-    parser.add_argument("--intensity_lr", type=float, default=0.05)
+    parser.add_argument("--position_lr", type=float, default=0.01)
+    parser.add_argument("--intensity_lr", type=float, default=0.05,
+                        help="LR for log-intensity (multiplicative: 0.05 ~= 5%%/step)")
     parser.add_argument("--lambda_dssim", type=float, default=0.2)
     # Fitting a single point light against a multi-light (OLAT) dataset is
     # ill-posed. Use --target_view to instead fit ONE image (correct + fast).
