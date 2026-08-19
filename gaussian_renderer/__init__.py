@@ -85,7 +85,13 @@ def renderGI(
     if override_radiosities is None:
         radiosity_solver = RadiosityPropagater(RadiosityPropagationSettings(solver_type=pipe.solver_type, debug=pipe.debug, active_sh_degree=pc.active_sh_degree, max_sh_degree=pc.max_sh_degree, directional_light_source=ls.is_directional_light, **override_solver_settings))
 
-        radiosities = radiosity_solver(means3D, geovalues, scales, rotations, norm_factors, torch.clamp_min(emissions, 0.), brdf_coeffs, is_light_source)
+        # A light source with a *directional* emission profile (e.g. scene.spot_light.SpotLight)
+        # needs negative coefficients in the higher SH bands -- that is what shapes the lobe --
+        # so it opts out of the non-negativity clamp. The solver still clamps the evaluated
+        # radiance to >= 0, so this cannot make the emission negative anywhere.
+        solver_emissions = torch.clamp_min(emissions, 0.) if getattr(ls, "clamp_emissions", True) else emissions
+
+        radiosities = radiosity_solver(means3D, geovalues, scales, rotations, norm_factors, solver_emissions, brdf_coeffs, is_light_source)
     else:
         radiosities = torch.cat((override_radiosities, ls.get_emissions))
 
