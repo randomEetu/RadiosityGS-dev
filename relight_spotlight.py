@@ -148,21 +148,29 @@ def main():
     center = gaussians.get_xyz.detach().mean(dim=0)
     obj_radius = (gaussians.get_xyz.detach() - center).norm(dim=1).max()
 
+    # ``get_combined_args`` omits command-line values set to ``None`` when it
+    # merges them with a training ``cfg_args``.  Those optional relighting
+    # arguments do not occur in configs written before this script existed,
+    # so read them defensively rather than assuming they are namespace fields.
+    requested_light_pos = getattr(args, "light_pos", None)
+    requested_target = getattr(args, "target", None)
+    requested_intensity = getattr(args, "intensity", None)
+
     # ---- Defaults taken from the dataset's own point lights ----
     lit_cams = [c for c in train_cams if c.pl_pos is not None]
-    if args.light_pos is None or args.intensity is None:
+    if requested_light_pos is None or requested_intensity is None:
         if len(lit_cams) == 0:
             raise SystemExit("[ABORT] This scene has no per-camera point lights to take defaults from; "
                              "pass --light_pos and --intensity explicitly.")
         pl_positions = torch.stack([c.pl_pos.detach() for c in lit_cams])
         pl_intensities = torch.stack([c.pl_intensity.detach().reshape(3) for c in lit_cams])
 
-    light_pos = torch.tensor(args.light_pos, dtype=torch.float32, device="cuda") \
-        if args.light_pos is not None else pl_positions.mean(dim=0)
-    target = torch.tensor(args.target, dtype=torch.float32, device="cuda") \
-        if args.target is not None else center
-    intensity = torch.tensor(args.intensity, dtype=torch.float32, device="cuda") \
-        if args.intensity is not None else SH2RGB(pl_intensities.mean(dim=0))
+    light_pos = torch.tensor(requested_light_pos, dtype=torch.float32, device="cuda") \
+        if requested_light_pos is not None else pl_positions.mean(dim=0)
+    target = torch.tensor(requested_target, dtype=torch.float32, device="cuda") \
+        if requested_target is not None else center
+    intensity = torch.tensor(requested_intensity, dtype=torch.float32, device="cuda") \
+        if requested_intensity is not None else SH2RGB(pl_intensities.mean(dim=0))
     intensity = intensity * args.intensity_scale
 
     fit_degree = gaussians.active_sh_degree if args.fit_sh_degree < 0 else args.fit_sh_degree
