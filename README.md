@@ -72,6 +72,50 @@ radiosity = render_pkg['radiosity']
 renderGI(viewpoint_cam, gaussians, light_sources, ..., override_radiosities=radiosity)
 ```
 
+### Multiple local lights
+
+Point-light and spotlight rigs may contain any number of lights, as long as all
+lights in a rig have the same type. Optimize two point lights and render the
+saved result with:
+
+```bash
+python optimize_light.py -m output/50_Hotdog --light_type point --num_lights 2 --target_view 0
+python render.py -m output/50_Hotdog --lights_file output/50_Hotdog/light_optimization/<run>/point_lights.json --skip_novel --skip_mesh
+```
+
+For trainable spotlights, position, aim direction, and intensity are optimized;
+the cone shape is fixed:
+
+```bash
+python optimize_light.py -m output/50_Hotdog --light_type spot --num_lights 2 \
+    --cutoff_deg 20 --sigma_deg 12 --target_view 0
+```
+
+To place multiple fixed spotlights, repeat the per-light arguments:
+
+```bash
+python relight_spotlight.py -m output/50_Hotdog --num_lights 2 \
+    --light_pos 2 1 3 --target 0 0 0 --intensity 10 8 6 \
+    --light_pos -2 1 3 --target 0 0 0 --intensity 6 8 10 --all_views
+```
+
+Both optimization and spotlight relighting write a JSON light rig. A rig can
+also be authored by hand using this shape:
+
+```json
+{
+  "type": "point",
+  "lights": [
+    {"position": [2, 1, 3], "intensity": [10, 8, 6]},
+    {"position": [-2, 1, 3], "intensity": [6, 8, 10]}
+  ]
+}
+```
+
+Spot entries use `"type": "spot"` at the top level and additionally contain
+`direction` (or `target`), `cutoff_deg`, and `sigma_deg`. Mixed point/spot rigs
+are rejected explicitly.
+
 ## Full Evaluation
 ### Dataset Preparation
 We provide our sparse-view relighting dataset at [here](https://ucsdcloud-my.sharepoint.com/:u:/g/personal/k1jiang_ucsd_edu/IQA_85ZN9DbPSK3RqAOzmmR7AdKNhQHbqlB6kBqPZP6r7ss?e=cR5SIt). Stanford-ORB dataset can be found at [here](https://github.com/StanfordORB/Stanford-ORB). We have re-implemented the algorithm for improved efficiency, which has slightly impacted performance compared to the original paper. The re-implemented codebase is optimized towards sparse-view relighting, while slightly affecting the performance on Stanford-ORB dataset.

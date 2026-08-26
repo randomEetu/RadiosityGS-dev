@@ -28,6 +28,7 @@ from PIL import Image
 from scipy.spatial import cKDTree as KDTree
 from arguments import ModelParams, PipelineParams, get_combined_args
 from utils.mesh_utils import GaussianExtractor, to_cam_open3d, post_process_mesh
+from scene.light_rig import load_light_rig
 
 #----------------------------------------------------------------------------
 
@@ -82,21 +83,36 @@ if __name__ == "__main__":
     parser.add_argument('--num_walks', type=int, default=128)
     parser.add_argument('--nop', type=int, default=500000)
     parser.add_argument('--max_dist', type=float, default=0.1)
+    parser.add_argument('--lights_file', type=str, default="",
+                        help="JSON file containing a fixed homogeneous point- or spotlight rig. "
+                             "Overrides per-camera lights for train/test rendering.")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
     dataset = read_cfg(args.model_path)
 
     iteration, pipe = args.iteration, pipeline.extract(args)
+    if args.lights_file and pipe.compute_cov3D_python:
+        raise SystemExit("[ABORT] --compute_cov3D_python is not supported for local light rigs.")
     gaussians = GaussianModel(dataset)
     light_sources = LightModel(dataset)
     light_sources.create_from_env_map(init_intensity=1.)
     scene = Scene(dataset, gaussians, light_sources, load_iteration=iteration, shuffle=False)
+    if args.lights_file:
+        fit_degree = gaussians.active_sh_degree
+        light_sources = load_light_rig(
+            args.lights_file, max_sh_degree=gaussians.max_sh_degree,
+            fit_sh_degree=fit_degree, device="cuda")
+        print(f"Using {len(light_sources.get_xyz)} lights from {args.lights_file}")
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     
-    train_dir = os.path.join(args.model_path, 'train', "ours_{}".format(scene.loaded_iter))
-    test_dir = os.path.join(args.model_path, 'test', "ours_{}".format(scene.loaded_iter))
+    rig_suffix = ""
+    if args.lights_file:
+        rig_name = os.path.splitext(os.path.basename(args.lights_file))[0]
+        rig_suffix = "_" + "".join(c if c.isalnum() or c in "-_" else "_" for c in rig_name)
+    train_dir = os.path.join(args.model_path, 'train', "ours_{}{}".format(scene.loaded_iter, rig_suffix))
+    test_dir = os.path.join(args.model_path, 'test', "ours_{}{}".format(scene.loaded_iter, rig_suffix))
     novel_dir = os.path.join(args.model_path, 'novel', "ours_{}".format(scene.loaded_iter))
     gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)
     

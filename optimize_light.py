@@ -2,14 +2,13 @@
 # optimize_light.py
 #
 # Take a *trained* RadiosityGS scene, FREEZE all geometry/material (the surfels),
-# throw away the light, and re-solve ONLY a single point light from a random
+# throw away the light, and re-solve one or more homogeneous local lights from a random
 # initialization. Renders a fixed camera view at the start (random light) and
 # every few epochs so you can watch the light converge / "move" in the scene.
 #
-# This scene uses a single point light (GS^3-style pl_pos / pl_intensity stored
-# per camera). Those are fixed input data, not trainable parameters, so here we
-# introduce ONE global learnable point light (position + RGB intensity) and
-# optimize it against the frozen scene.
+# GS^3-style pl_pos / pl_intensity values stored per camera are fixed input
+# data, not trainable parameters. Here we replace them with one global,
+# homogeneous learnable rig and optimize it against the frozen scene.
 #
 # Runs on the GPU node (needs CUDA / the compiled radiosity solver). Nothing here
 # is meant to run on a CPU-only laptop.
@@ -30,6 +29,8 @@ from tqdm import tqdm
 from scene import Scene
 from scene.gaussian_model import GaussianModel
 from scene.light_source import LightModel
+from scene.light_rig import save_light_rig
+from scene.spot_light import LearnableSpotLights
 from gaussian_renderer import renderGI
 from arguments import PipelineParams, get_combined_args
 from utils.loss_utils import l1_loss, ssim
@@ -41,7 +42,7 @@ from render import read_cfg
 
 
 class LearnablePointLight:
-    """A single, global, trainable point light.
+    """A homogeneous batch of global, trainable point lights.
 
     Mirrors the interface that ``renderGI`` expects from a light-source object
     (see ``LightModel.from_camera_if_possible``). Only the position and the RGB
@@ -62,8 +63,12 @@ class LearnablePointLight:
         # at that scale, so the optimizer ends up "fixing" brightness by moving
         # the light's DISTANCE (1/r^2 falloff) instead of its intensity -- which
         # leaves the light's DIRECTION, and hence the shadows, frozen in place.
-        log_intensity = torch.log(init_intensity_sh.reshape(1, 3).float().to(device).clamp_min(1e-8))
-        self._xyz = nn.Parameter(init_xyz.reshape(1, 3).float().to(device).contiguous())
+        init_xyz = init_xyz.reshape(-1, 3).float().to(device)
+        init_intensity_sh = init_intensity_sh.reshape(-1, 3).float().to(device)
+        if init_xyz.shape != init_intensity_sh.shape or len(init_xyz) == 0:
+            raise ValueError("point-light positions and intensities must both have shape (N, 3)")
+        log_intensity = torch.log(init_intensity_sh.clamp_min(1e-8))
+        self._xyz = nn.Parameter(init_xyz.contiguous())
         self._intensity = nn.Parameter(log_intensity.contiguous())
 
     # --- trainable ---
@@ -78,32 +83,32 @@ class LearnablePointLight:
 
     @property
     def get_emissions(self):
-        # (1, (deg+1)^2, 3): only the DC band emits; higher bands are zero.
-        dc = self.get_dc[:, None, :]  # (1, 1, 3)
+        # (N, (deg+1)^2, 3): only the DC band emits; higher bands are zero.
+        dc = self.get_dc[:, None, :]
         n_rest = (self.max_sh_degree + 1) ** 2 - 1
-        rest = torch.zeros((1, n_rest, 3), dtype=dc.dtype, device=self._device)
+        rest = torch.zeros((len(self._xyz), n_rest, 3), dtype=dc.dtype, device=self._device)
         return torch.cat((dc, rest), dim=1)
 
     # --- fixed constants (match a per-camera point light) ---
     @property
     def get_geovalue(self):
-        return torch.tensor([6.], device=self._device)[None]
+        return torch.full((len(self._xyz), 1), 6., device=self._device)
 
     @property
     def get_norm_factor(self):
-        return torch.tensor([1.], device=self._device)[None]
+        return torch.ones((len(self._xyz), 1), device=self._device)
 
     @property
     def get_scaling(self):
-        return torch.tensor([1e-3, 1e-3], device=self._device)[None]
+        return torch.tensor([1e-3, 1e-3], device=self._device)[None].repeat(len(self._xyz), 1)
 
     @property
     def get_rotation(self):
-        return torch.tensor([1., 0., 0., 0.], device=self._device)[None]
+        return torch.tensor([1., 0., 0., 0.], device=self._device)[None].repeat(len(self._xyz), 1)
 
     @property
     def get_is_light_source(self):
-        return torch.tensor([True], device=self._device)[None]
+        return torch.ones((len(self._xyz), 1), dtype=torch.bool, device=self._device)
 
     def parameters(self):
         return [self._xyz, self._intensity]
@@ -133,7 +138,7 @@ def alpha_of(cam, ref):
 
 
 def main():
-    parser = ArgumentParser(description="Re-solve a single point light for a trained RadiosityGS scene")
+    parser = ArgumentParser(description="Re-solve a homogeneous local-light rig for a trained RadiosityGS scene")
     pipeline = PipelineParams(parser)
     parser.add_argument("--model_path", "-m", type=str, required=True,
                         help="Path to the trained model (the output/... folder)")
@@ -141,6 +146,19 @@ def main():
                         help="Which saved iteration to load (-1 = latest)")
     parser.add_argument("--epochs", type=int, default=25,
                         help="Number of passes over the training views")
+    parser.add_argument("--num_lights", type=int, default=1,
+                        help="Number of homogeneous lights to optimize")
+    parser.add_argument("--light_type", choices=["point", "spot"], default="point")
+    parser.add_argument("--direction_lr", type=float, default=0.005,
+                        help="Learning rate for spotlight orientation quaternions")
+    parser.add_argument("--cutoff_deg", type=float, default=20.,
+                        help="Fixed spotlight inner-cone half-angle")
+    parser.add_argument("--sigma_deg", type=float, default=12.,
+                        help="Fixed spotlight roll-off width")
+    parser.add_argument("--fit_sh_degree", type=int, default=-1,
+                        help="Spotlight SH profile degree (-1 = model active degree)")
+    parser.add_argument("--ridge", type=float, default=1e-8,
+                        help="Spotlight SH-profile fit regularization")
     parser.add_argument("--save_interval", type=int, default=5,
                         help="Save a fixed-view render every N epochs (epoch 0 always saved)")
     parser.add_argument("--num_walks", type=int, default=64,
@@ -149,7 +167,7 @@ def main():
     parser.add_argument("--intensity_lr", type=float, default=0.05,
                         help="LR for log-intensity (multiplicative: 0.05 ~= 5%%/step)")
     parser.add_argument("--lambda_dssim", type=float, default=0.2)
-    # Fitting a single point light against a multi-light (OLAT) dataset is
+    # Fitting one fixed rig against a dataset whose light changes per image is
     # ill-posed. Use --target_view to instead fit ONE image (correct + fast).
     parser.add_argument("--target_view", type=int, default=-1,
                         help="If >=0, optimize the light to reproduce a SINGLE train view "
@@ -185,6 +203,9 @@ def main():
     parser.add_argument("--quiet", action="store_true")
     args = get_combined_args(parser)
 
+    if args.num_lights < 1:
+        parser.error("--num_lights must be at least 1")
+
     safe_state(args.quiet)
     torch.autograd.set_detect_anomaly(False)
     torch.manual_seed(args.seed)
@@ -193,6 +214,8 @@ def main():
     # ---- Load the trained scene (frozen) ----
     dataset = read_cfg(args.model_path)
     pipe = pipeline.extract(args)
+    if pipe.compute_cov3D_python:
+        raise SystemExit("[ABORT] --compute_cov3D_python is not supported for local light rigs.")
 
     gaussians = GaussianModel(dataset)
     light_sources = LightModel(dataset)  # only needed so Scene can load; we discard it
@@ -206,25 +229,29 @@ def main():
     train_cams = scene.getTrainCameras()
     test_cams = scene.getTestCameras()
 
-    # ---- Sanity check: this must be a point-light scene ----
+    # ---- Dataset-light statistics, used only for initialization ----
     lit_cams = [c for c in train_cams if c.pl_pos is not None]
     if len(lit_cams) == 0:
-        print("\n[ABORT] The training cameras have no point lights (pl_pos is None).")
-        print("        This looks like an environment-map scene, so there is no point")
-        print("        light to solve. Optimize LightModel._intensity instead.")
-        sys.exit(1)
-
-    pl_positions = torch.stack([c.pl_pos.detach() for c in lit_cams])  # (V, 3)
-    pos_std = pl_positions.std(dim=0)
-    print(f"\nPoint light present in {len(lit_cams)}/{len(train_cams)} train views.")
-    print(f"Dataset pl_pos  mean = {pl_positions.mean(0).tolist()}")
-    print(f"Dataset pl_pos  std  = {pos_std.tolist()}  "
-          f"(near-zero std => a single global light; large std => per-view/OLAT lights)")
-    obj_radius_hint = (gaussians.get_xyz.detach() - gaussians.get_xyz.detach().mean(0)).norm(dim=1).max()
-    if pos_std.max() > 0.1 * obj_radius_hint and args.target_view < 0:
-        print("\n[WARNING] Light position varies a lot across views => this looks like a")
-        print("          MULTI-LIGHT (OLAT) dataset. A single global light cannot fit all")
-        print("          views and will drift. Re-run with --target_view <i> to fit ONE image.\n")
+        if args.init_mode != "sphere" or not args.random_intensity:
+            print("\n[ABORT] The training cameras have no point-light metadata for initialization.")
+            print("        Re-run with --init_mode sphere --random_intensity to initialize")
+            print("        a local-light rig without dataset light metadata.")
+            sys.exit(1)
+        pl_positions = None
+        pos_std = None
+        print("\nNo point-light metadata present; using fully random rig initialization.")
+    else:
+        pl_positions = torch.stack([c.pl_pos.detach() for c in lit_cams])  # (V, 3)
+        pos_std = pl_positions.std(dim=0, unbiased=False)
+        print(f"\nPoint light present in {len(lit_cams)}/{len(train_cams)} train views.")
+        print(f"Dataset pl_pos  mean = {pl_positions.mean(0).tolist()}")
+        print(f"Dataset pl_pos  std  = {pos_std.tolist()}  "
+              f"(near-zero std => a single global light; large std => per-view/OLAT lights)")
+        obj_radius_hint = (gaussians.get_xyz.detach() - gaussians.get_xyz.detach().mean(0)).norm(dim=1).max()
+        if pos_std.max() > 0.1 * obj_radius_hint and args.target_view < 0:
+            print("\n[WARNING] Light position varies a lot across views => this looks like a")
+            print("          OLAT dataset. One fixed global light rig cannot fit all")
+            print("          views and will drift. Re-run with --target_view <i> to fit ONE image.\n")
 
     # ---- Randomly initialize the single learnable point light ----
     center = gaussians.get_xyz.detach().mean(dim=0)
@@ -235,30 +262,61 @@ def main():
         # Guarantees the light starts in front of / illuminating the object, so the
         # loss has a live gradient. The specific target light is still "forgotten".
         pos_mean = pl_positions.mean(dim=0)
-        init_xyz = pos_mean + torch.randn(3, device="cuda") * pos_std
+        # A single-light dataset has zero positional variance. Give a multi-light
+        # rig a small floor so its emitters do not start coincident with identical
+        # gradients and remain permanently symmetric.
+        pos_scale = torch.maximum(pos_std, torch.ones_like(pos_std) * obj_radius * 0.05)
+        init_xyz = pos_mean[None] + torch.randn(args.num_lights, 3, device="cuda") * pos_scale[None]
     else:  # sphere
-        direction = torch.randn(3, device="cuda")
-        direction = direction / direction.norm()
-        init_xyz = center + direction * obj_radius * args.init_dist_scale
+        direction = torch.randn(args.num_lights, 3, device="cuda")
+        direction = direction / direction.norm(dim=1, keepdim=True)
+        init_xyz = center[None] + direction * obj_radius * args.init_dist_scale
 
     if args.random_intensity:
-        init_intensity_sh = RGB2SH(torch.rand(3, device="cuda") * args.init_intensity)
+        init_intensity_rgb = torch.rand(args.num_lights, 3, device="cuda") * args.init_intensity
+        init_intensity_sh = RGB2SH(init_intensity_rgb)
     else:
         # Seed intensity from the dataset's average so brightness is well-scaled;
         # only the *position* is "forgotten". Add --random_intensity to forget both.
         pl_ints = torch.stack([c.pl_intensity.detach().reshape(3) for c in lit_cams])  # (V, 3) SH DC
-        init_intensity_sh = pl_ints.mean(dim=0)
+        # Split the average energy across the initial emitters. This keeps the
+        # initial rendered brightness roughly independent of --num_lights.
+        mean_intensity_sh = pl_ints.mean(dim=0)
+        init_intensity_sh = mean_intensity_sh[None].repeat(args.num_lights, 1) / args.num_lights
+        init_intensity_rgb = SH2RGB(mean_intensity_sh)[None].repeat(args.num_lights, 1)
+        init_intensity_rgb = init_intensity_rgb / args.num_lights
 
-    point_light = LearnablePointLight(gaussians.max_sh_degree, init_xyz, init_intensity_sh)
+    if args.light_type == "point":
+        lights = LearnablePointLight(gaussians.max_sh_degree, init_xyz, init_intensity_sh)
+    else:
+        fit_degree = gaussians.active_sh_degree if args.fit_sh_degree < 0 else args.fit_sh_degree
+        if fit_degree < 0 or fit_degree > gaussians.active_sh_degree:
+            raise SystemExit(f"[ABORT] --fit_sh_degree must be between 0 and the model's active "
+                             f"SH degree {gaussians.active_sh_degree}; got {fit_degree}.")
+        lights = LearnableSpotLights(
+            init_xyz, center[None] - init_xyz, init_intensity_rgb.clamp_min(1e-8),
+            cutoff_deg=args.cutoff_deg, sigma_deg=args.sigma_deg,
+            max_sh_degree=gaussians.max_sh_degree, fit_sh_degree=fit_degree,
+            ridge=args.ridge)
     print(f"\nInit mode: {args.init_mode}")
-    print(f"Initial light position:  {point_light._xyz.detach().reshape(3).tolist()}")
-    print(f"Initial light RGB:       {SH2RGB(point_light.get_dc.detach().reshape(3)).tolist()}")
+    initial_rgb = SH2RGB(lights.get_dc.detach()) if args.light_type == "point" else lights.get_intensity.detach()
+    for i, (pos, rgb) in enumerate(zip(lights._xyz.detach(), initial_rgb)):
+        print(f"Initial light[{i}] position: {pos.tolist()} | RGB: {rgb.tolist()}")
+        if args.light_type == "spot":
+            print(f"                 direction: {lights.get_direction.detach()[i].tolist()}")
     print(f"Object center / radius:  {center.tolist()} / {obj_radius.item():.4f}")
 
-    optimizer = torch.optim.Adam([
-        {"params": [point_light._xyz], "lr": args.position_lr, "name": "position"},
-        {"params": [point_light._intensity], "lr": args.intensity_lr, "name": "intensity"},
-    ], eps=1e-15)
+    param_groups = [
+        {"params": [lights._xyz], "lr": args.position_lr, "name": "position"},
+    ]
+    if args.light_type == "point":
+        param_groups.append({"params": [lights._intensity], "lr": args.intensity_lr, "name": "intensity"})
+    else:
+        param_groups.extend([
+            {"params": [lights._rotation], "lr": args.direction_lr, "name": "direction"},
+            {"params": [lights._log_intensity], "lr": args.intensity_lr, "name": "intensity"},
+        ])
+    optimizer = torch.optim.Adam(param_groups, eps=1e-15)
 
     solver_settings = {
         "inverse_falloff_max": dataset.max_inverse_falloff,
@@ -303,29 +361,33 @@ def main():
 
     @torch.no_grad()
     def save_snapshot(epoch):
-        pkg = renderGI(fixed_cam, gaussians, point_light, pipe, background,
+        pkg = renderGI(fixed_cam, gaussians, lights, pipe, background,
                        override_solver_settings=solver_settings)
         img = pkg["render"].clamp(0., 1.)
         save_img_u8(img.permute(1, 2, 0).cpu().numpy(),
                     os.path.join(out_dir, f"epoch_{epoch}.png"))
         p = psnr(img, fixed_gt).mean().item()
-        pos = point_light._xyz.detach().reshape(3).tolist()
-        rgb = SH2RGB(point_light.get_dc.detach().reshape(3)).tolist()
-        print(f"[epoch {epoch:>3}] saved epoch_{epoch}.png | fixed-view PSNR {p:5.2f} | "
-              f"light pos [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}] | "
-              f"RGB [{rgb[0]:.2f}, {rgb[1]:.2f}, {rgb[2]:.2f}]")
+        print(f"[epoch {epoch:>3}] saved epoch_{epoch}.png | fixed-view PSNR {p:5.2f}")
+        current_rgb = SH2RGB(lights.get_dc.detach()) if args.light_type == "point" else lights.get_intensity.detach()
+        for i, (pos, rgb) in enumerate(zip(lights._xyz.detach(), current_rgb)):
+            print(f"  light[{i}] pos [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}] | "
+                  f"RGB [{rgb[0]:.2f}, {rgb[1]:.2f}, {rgb[2]:.2f}]")
+            if args.light_type == "spot":
+                direction = lights.get_direction.detach()[i]
+                print(f"           dir [{direction[0]:+.3f}, {direction[1]:+.3f}, {direction[2]:+.3f}]")
 
     # Clamp based on the dataset's light cloud so a valid solution is never
     # clipped; fall back to object-radii if that is somehow smaller.
-    pl_dist_max = (pl_positions - center).norm(dim=1).max().item()
+    pl_dist_max = ((pl_positions - center).norm(dim=1).max().item()
+                   if pl_positions is not None else 0.)
     max_dist = max(pl_dist_max * 1.5, (obj_radius * args.max_light_dist).item())
 
     def clamp_light():
         with torch.no_grad():
-            d = point_light._xyz - center  # (1, 3)
-            dist = d.norm()
-            if dist > max_dist:
-                point_light._xyz.copy_(center + d / dist * max_dist)
+            d = lights._xyz - center[None]
+            dist = d.norm(dim=1, keepdim=True)
+            scale = (max_dist / dist.clamp_min(1e-8)).clamp_max(1.)
+            lights._xyz.copy_(center[None] + d * scale)
 
     # How many gradient steps per epoch, and which views they use.
     if target_mode:
@@ -350,7 +412,7 @@ def main():
         pbar = tqdm(batch, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
         for idx in pbar:
             cam = train_cams[idx]
-            pkg = renderGI(cam, gaussians, point_light, pipe, background,
+            pkg = renderGI(cam, gaussians, lights, pipe, background,
                            override_solver_settings=solver_settings)
             image = pkg["render"]
 
@@ -371,7 +433,14 @@ def main():
         if epoch % args.save_interval == 0 or epoch == args.epochs:
             save_snapshot(epoch)
 
-    print(f"\nDone. See {out_dir}/epoch_*.png (and gt_reference.png).")
+    rig_path = os.path.join(out_dir, f"{args.light_type}_lights.json")
+    if args.light_type == "point":
+        save_light_rig(rig_path, "point", lights._xyz, SH2RGB(lights.get_dc))
+    else:
+        save_light_rig(rig_path, "spot", lights._xyz, lights.get_intensity,
+                       directions=lights.get_direction,
+                       cutoff_deg=lights.cutoff_deg, sigma_deg=lights.sigma_deg)
+    print(f"\nDone. See {out_dir}/epoch_*.png and {rig_path}.")
 
 
 if __name__ == "__main__":

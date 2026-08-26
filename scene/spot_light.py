@@ -212,14 +212,15 @@ def quat_from_z_to(direction: torch.Tensor) -> torch.Tensor:
 
 
 class SpotLight:
-    """A single point light with a cone-shaped emission profile.
+    """A homogeneous batch of point lights with cone-shaped emission profiles.
 
     Duck-types the light-source object ``renderGI`` expects (the same interface as
     ``LightModel.from_camera_if_possible`` / ``LearnablePointLight``). Not
     trainable: this is for relighting a frozen scene from arbitrary spot
     positions and angles.
 
-    ``intensity`` is linear RGB radiance at the centre of the cone, in the same
+    Inputs may be one ``(3,)`` vector or an ``(N, 3)`` batch. ``intensity`` is
+    linear RGB radiance at the centre of each cone, in the same
     units as a dataset point light's ``pl_intensity`` before ``RGB2SH``, so
     passing the dataset's mean RGB reproduces its brightness on the axis.
     """
@@ -234,22 +235,48 @@ class SpotLight:
         self.fit_sh_degree = max_sh_degree if fit_sh_degree is None else fit_sh_degree
         assert 0 <= self.fit_sh_degree <= max_sh_degree
         self.is_directional_light = False
-        self.cutoff_deg = cutoff_deg
-        self.sigma_deg = sigma_deg
         self._device = device
 
-        self._xyz = torch.as_tensor(position, dtype=torch.float32, device=device).reshape(1, 3)
+        self._xyz = torch.as_tensor(position, dtype=torch.float32, device=device).reshape(-1, 3).contiguous()
         self._direction = torch.nn.functional.normalize(
-            torch.as_tensor(direction, dtype=torch.float32, device=device).reshape(3), dim=0)
-        self._intensity = torch.as_tensor(intensity, dtype=torch.float32, device=device).reshape(3)
+            torch.as_tensor(direction, dtype=torch.float32, device=device).reshape(-1, 3), dim=1)
+        self._intensity = torch.as_tensor(intensity, dtype=torch.float32, device=device).reshape(-1, 3)
+        if len(self._xyz) == 0:
+            raise ValueError("a light rig must contain at least one spotlight")
+        if self._direction.shape != self._xyz.shape or self._intensity.shape != self._xyz.shape:
+            raise ValueError("spotlight positions, directions, and intensities must all have shape (N, 3)")
+
+        def per_light(value, name):
+            values = torch.as_tensor(value, dtype=torch.float64).reshape(-1).tolist()
+            if len(values) == 1:
+                values *= len(self._xyz)
+            if len(values) != len(self._xyz):
+                raise ValueError(f"{name} must be scalar or contain one value per spotlight")
+            return values
+
+        self.cutoff_degrees = per_light(cutoff_deg, "cutoff_deg")
+        self.sigma_degrees = per_light(sigma_deg, "sigma_deg")
+        # Preserve the original scalar attributes for a one-light instance.
+        self.cutoff_deg = self.cutoff_degrees[0] if len(self._xyz) == 1 else self.cutoff_degrees
+        self.sigma_deg = self.sigma_degrees[0] if len(self._xyz) == 1 else self.sigma_degrees
 
         # The profile fit only depends on (degree, cutoff, sigma) -- do it on the
-        # CPU in double precision, once.
-        profile, self.fit = fit_spot_sh(self.fit_sh_degree, cutoff_deg, sigma_deg,
-                                        num_samples=num_samples, ridge=ridge)
+        # CPU in double precision. Reuse fits for identical cone shapes.
         n_bands = (max_sh_degree + 1) ** 2
-        self._profile = torch.zeros(n_bands, dtype=torch.float32, device=device)
-        self._profile[: len(profile)] = profile.to(device)
+        profiles, self.fits, cache = [], [], {}
+        for cutoff, sigma in zip(self.cutoff_degrees, self.sigma_degrees):
+            key = (cutoff, sigma)
+            if key not in cache:
+                cache[key] = fit_spot_sh(self.fit_sh_degree, cutoff, sigma,
+                                         num_samples=num_samples, ridge=ridge)
+            profile, report = cache[key]
+            padded = torch.zeros(n_bands, dtype=torch.float32, device=device)
+            padded[:len(profile)] = profile.to(device)
+            profiles.append(padded)
+            self.fits.append(report)
+        self._profile = torch.stack(profiles)
+        # Backward-compatible access used by the single-spot CLI.
+        self.fit = self.fits[0]
 
     # --- aiming ---
     @property
@@ -258,51 +285,145 @@ class SpotLight:
 
     @property
     def get_rotation(self):
-        return quat_from_z_to(self._direction)[None].to(self._device)
+        return torch.stack([quat_from_z_to(d) for d in self._direction]).to(self._device)
 
     def look_at(self, target):
         """Aim the cone at a world-space point."""
-        target = torch.as_tensor(target, dtype=torch.float32, device=self._device).reshape(3)
-        self._direction = torch.nn.functional.normalize(target - self._xyz.reshape(3), dim=0)
+        target = torch.as_tensor(target, dtype=torch.float32, device=self._device).reshape(-1, 3)
+        if len(target) == 1:
+            target = target.repeat(len(self._xyz), 1)
+        if target.shape != self._xyz.shape:
+            raise ValueError("targets must have shape (N, 3), or one target may be broadcast")
+        self._direction = torch.nn.functional.normalize(target - self._xyz, dim=1)
         return self
 
     def place(self, position, target=None):
         """Move the light, optionally re-aiming it at ``target``."""
-        self._xyz = torch.as_tensor(position, dtype=torch.float32, device=self._device).reshape(1, 3).contiguous()
+        position = torch.as_tensor(position, dtype=torch.float32, device=self._device).reshape(-1, 3)
+        if len(position) == 1 and len(self._xyz) > 1:
+            position = position.repeat(len(self._xyz), 1)
+        if position.shape != self._xyz.shape:
+            raise ValueError("positions must preserve the number of spotlights")
+        self._xyz = position.contiguous()
         return self.look_at(target) if target is not None else self
 
     # --- emission ---
     @property
     def get_emissions(self):
-        # (1, (deg+1)^2, 3). The scalar profile has a peak of 1, so scaling it by
+        # (N, (deg+1)^2, 3). Each scalar profile has a peak of 1, so scaling it by
         # the RGB radiance gives `spot_factor(theta) * intensity` on evaluation.
-        return (self._profile[None, :, None] * self._intensity[None, None, :]).contiguous()
+        return (self._profile[:, :, None] * self._intensity[:, None, :]).contiguous()
 
     # --- fixed constants (match a per-camera point light) ---
     @property
     def get_geovalue(self):
-        return torch.tensor([6.], device=self._device)[None]
+        return torch.full((len(self._xyz), 1), 6., device=self._device)
 
     @property
     def get_norm_factor(self):
-        return torch.tensor([1.], device=self._device)[None]
+        return torch.ones((len(self._xyz), 1), device=self._device)
 
     @property
     def get_scaling(self):
-        return torch.tensor([1e-3, 1e-3], device=self._device)[None]
+        return torch.tensor([1e-3, 1e-3], device=self._device)[None].repeat(len(self._xyz), 1)
 
     @property
     def get_is_light_source(self):
-        return torch.tensor([True], device=self._device)[None]
+        return torch.ones((len(self._xyz), 1), dtype=torch.bool, device=self._device)
+
+    def from_camera_if_possible(self, camera):
+        return self
 
     def describe(self):
-        pos = self._xyz.reshape(3).tolist()
-        d = self._direction.tolist()
-        rgb = self._intensity.tolist()
-        return (f"spotlight pos [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}] "
+        lines = []
+        for i, (pos, d, rgb, cutoff, sigma, fit) in enumerate(zip(
+                self._xyz.tolist(), self._direction.tolist(), self._intensity.tolist(),
+                self.cutoff_degrees, self.sigma_degrees, self.fits)):
+            lines.append(
+                f"spotlight[{i}] pos [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}] "
                 f"dir [{d[0]:+.3f}, {d[1]:+.3f}, {d[2]:+.3f}] "
                 f"RGB [{rgb[0]:.3f}, {rgb[1]:.3f}, {rgb[2]:.3f}] "
-                f"cutoff {self.cutoff_deg:g} deg, sigma {self.sigma_deg:g} deg, SH degree {self.fit_sh_degree}\n"
-                f"           SH fit: max err {self.fit['max_abs_error']:.3f}, on-axis {self.fit['on_axis']:.3f}, "
-                f"half-power at {self.fit['half_power_deg']:.1f} deg, halo {self.fit['halo']:.3f}, "
-                f"fp32 err {self.fit['float32_error']:.1e}")
+                f"cutoff {cutoff:g} deg, sigma {sigma:g} deg, SH degree {self.fit_sh_degree}\n"
+                f"             SH fit: max err {fit['max_abs_error']:.3f}, on-axis {fit['on_axis']:.3f}, "
+                f"half-power at {fit['half_power_deg']:.1f} deg, halo {fit['halo']:.3f}, "
+                f"fp32 err {fit['float32_error']:.1e}")
+        return "\n".join(lines)
+
+
+class LearnableSpotLights:
+    """A trainable homogeneous spotlight batch.
+
+    Positions, orientations, and log-RGB intensities are parameters. Cone shape
+    remains fixed because changing cutoff/sigma requires refitting its SH
+    profile and is not part of the solver's differentiable path.
+    """
+
+    clamp_emissions = False
+    is_directional_light = False
+
+    def __init__(self, positions, directions, intensities, cutoff_deg=20.,
+                 sigma_deg=12., max_sh_degree=9, fit_sh_degree=None,
+                 num_samples=20000, ridge=1e-8, device="cuda"):
+        fixed = SpotLight(
+            positions, directions, intensities, cutoff_deg=cutoff_deg,
+            sigma_deg=sigma_deg, max_sh_degree=max_sh_degree,
+            fit_sh_degree=fit_sh_degree, num_samples=num_samples,
+            ridge=ridge, device=device)
+        self.max_sh_degree = max_sh_degree
+        self.fit_sh_degree = fixed.fit_sh_degree
+        self.cutoff_deg = fixed.cutoff_deg
+        self.sigma_deg = fixed.sigma_deg
+        self.cutoff_degrees = fixed.cutoff_degrees
+        self.sigma_degrees = fixed.sigma_degrees
+        self.fits = fixed.fits
+        self.fit = fixed.fit
+        self._profile = fixed._profile
+        self._device = device
+        self._xyz = torch.nn.Parameter(fixed._xyz.detach().clone())
+        self._rotation = torch.nn.Parameter(fixed.get_rotation.detach().clone())
+        self._log_intensity = torch.nn.Parameter(
+            torch.log(fixed._intensity.detach().clone().clamp_min(1e-8)))
+
+    @property
+    def get_xyz(self):
+        return self._xyz
+
+    @property
+    def get_rotation(self):
+        return torch.nn.functional.normalize(self._rotation, dim=1)
+
+    @property
+    def get_intensity(self):
+        return torch.exp(self._log_intensity.clamp(-30., 30.))
+
+    @property
+    def get_direction(self):
+        # Third column of the quaternion rotation matrix: R(q) @ local +z.
+        q = self.get_rotation
+        w, x, y, z = q.unbind(dim=1)
+        return torch.stack((2. * (x * z + w * y),
+                            2. * (y * z - w * x),
+                            1. - 2. * (x * x + y * y)), dim=1)
+
+    @property
+    def get_emissions(self):
+        return (self._profile[:, :, None] * self.get_intensity[:, None, :]).contiguous()
+
+    @property
+    def get_geovalue(self):
+        return torch.full((len(self._xyz), 1), 6., device=self._device)
+
+    @property
+    def get_norm_factor(self):
+        return torch.ones((len(self._xyz), 1), device=self._device)
+
+    @property
+    def get_scaling(self):
+        return torch.tensor([1e-3, 1e-3], device=self._device)[None].repeat(len(self._xyz), 1)
+
+    @property
+    def get_is_light_source(self):
+        return torch.ones((len(self._xyz), 1), dtype=torch.bool, device=self._device)
+
+    def parameters(self):
+        return [self._xyz, self._rotation, self._log_intensity]

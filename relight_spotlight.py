@@ -1,7 +1,7 @@
 #
 # relight_spotlight.py
 #
-# Relight a *trained* RadiosityGS scene with a SPOTLIGHT instead of the point
+# Relight a *trained* RadiosityGS scene with one or more SPOTLIGHTS instead of the point
 # light it was captured with. Nothing is optimized here -- geometry, materials and
 # the spot are all fixed inputs; this just renders.
 #
@@ -47,6 +47,7 @@ from tqdm import tqdm
 from scene import Scene
 from scene.gaussian_model import GaussianModel
 from scene.light_source import LightModel
+from scene.light_rig import save_light_rig
 from scene.spot_light import SpotLight, ascii_profile
 from gaussian_renderer import renderGI
 from arguments import PipelineParams, get_combined_args
@@ -84,14 +85,16 @@ def main():
                         help="SH degree used for the profile (-1 = the model's active degree). "
                              "Lower = smoother cone, less ringing")
     parser.add_argument("--ridge", type=float, default=1e-8, help="Smoothness weight of the SH fit")
+    parser.add_argument("--num_lights", type=int, default=1,
+                        help="Number of homogeneous spotlights to render")
 
     # --- placement ---
-    parser.add_argument("--light_pos", type=float, nargs=3, default=None,
-                        help="World-space light position (default: the dataset's mean pl_pos)")
-    parser.add_argument("--target", type=float, nargs=3, default=None,
-                        help="World-space point the cone is aimed at (default: the object's center)")
-    parser.add_argument("--intensity", type=float, nargs=3, default=None,
-                        help="On-axis linear RGB radiance (default: the dataset's mean pl_intensity)")
+    parser.add_argument("--light_pos", type=float, nargs=3, action="append", default=None,
+                        help="World-space light position; repeat once per light")
+    parser.add_argument("--target", type=float, nargs=3, action="append", default=None,
+                        help="World-space aim point; repeat once per light (one value broadcasts)")
+    parser.add_argument("--intensity", type=float, nargs=3, action="append", default=None,
+                        help="On-axis linear RGB radiance; repeat once per light (one value broadcasts)")
     parser.add_argument("--intensity_scale", type=float, default=1.,
                         help="Multiplies --intensity. A spot concentrates the same nominal intensity "
                              "into a cone, so the lit patch is as bright as the point light was there")
@@ -120,6 +123,11 @@ def main():
                         help="Where to write the renders (default: <model_path>/spotlight_relight/<timestamp>)")
     parser.add_argument("--quiet", action="store_true")
     args = get_combined_args(parser)
+
+    if args.num_lights < 1:
+        parser.error("--num_lights must be at least 1")
+    if args.num_lights > 1 and args.sweep != "fixed" and not args.all_views:
+        parser.error("multi-spot rigs currently support --sweep fixed; use --all_views to render all cameras")
 
     safe_state(args.quiet)
 
@@ -165,12 +173,29 @@ def main():
         pl_positions = torch.stack([c.pl_pos.detach() for c in lit_cams])
         pl_intensities = torch.stack([c.pl_intensity.detach().reshape(3) for c in lit_cams])
 
-    light_pos = torch.tensor(requested_light_pos, dtype=torch.float32, device="cuda") \
-        if requested_light_pos is not None else pl_positions.mean(dim=0)
-    target = torch.tensor(requested_target, dtype=torch.float32, device="cuda") \
-        if requested_target is not None else center
-    intensity = torch.tensor(requested_intensity, dtype=torch.float32, device="cuda") \
-        if requested_intensity is not None else SH2RGB(pl_intensities.mean(dim=0))
+    def batch_arg(value, default, name):
+        if value is None:
+            result = default.reshape(-1, 3)
+        else:
+            result = torch.tensor(value, dtype=torch.float32, device="cuda").reshape(-1, 3)
+        if len(result) == 1:
+            result = result.repeat(args.num_lights, 1)
+        if len(result) != args.num_lights:
+            parser.error(f"{name} must be given once or exactly --num_lights times")
+        return result
+
+    if requested_light_pos is None:
+        # Spread default lights over actual dataset positions instead of placing
+        # all emitters on top of one another.
+        ids = torch.linspace(0, len(pl_positions) - 1, args.num_lights, device="cuda").long()
+        default_positions = pl_positions[ids]
+    else:
+        default_positions = center[None]
+    light_pos = batch_arg(requested_light_pos, default_positions, "--light_pos")
+    target = batch_arg(requested_target, center[None], "--target")
+    default_intensity = SH2RGB(pl_intensities.mean(dim=0))[None] / args.num_lights \
+        if requested_intensity is None else torch.ones((1, 3), device="cuda")
+    intensity = batch_arg(requested_intensity, default_intensity, "--intensity")
     intensity = intensity * args.intensity_scale
 
     fit_degree = gaussians.active_sh_degree if args.fit_sh_degree < 0 else args.fit_sh_degree
@@ -228,19 +253,21 @@ def main():
             axis = torch.tensor(args.orbit_axis, dtype=torch.float32, device="cuda")
             axis = torch.nn.functional.normalize(axis, dim=0)
             u, v = orthonormal_basis(axis)
-            radius = (light_pos - target).norm() if args.orbit_radius < 0 else obj_radius * args.orbit_radius
+            single_pos, single_target = light_pos[0], target[0]
+            radius = (single_pos - single_target).norm() if args.orbit_radius < 0 else obj_radius * args.orbit_radius
             elev = math.radians(args.orbit_elevation)
             for f in range(frames):
                 phi = math.radians(args.orbit_degrees) * f / frames
                 offset = (math.cos(phi) * math.cos(elev) * u
                           + math.sin(phi) * math.cos(elev) * v
                           + math.sin(elev) * axis)
-                jobs.append((cam, target + radius * offset, target, f"orbit_{f:04d}"))
+                jobs.append((cam, single_target + radius * offset, single_target, f"orbit_{f:04d}"))
         else:  # aim
             axis = torch.nn.functional.normalize(
                 torch.tensor(args.aim_axis, dtype=torch.float32, device="cuda"), dim=0)
-            base_dir_vec = torch.nn.functional.normalize(target - light_pos, dim=0)
-            reach = (target - light_pos).norm()
+            single_pos, single_target = light_pos[0], target[0]
+            base_dir_vec = torch.nn.functional.normalize(single_target - single_pos, dim=0)
+            reach = (single_target - single_pos).norm()
             for f in range(frames):
                 # Rotate the aim direction about `axis` (Rodrigues), sweeping
                 # symmetrically about the base direction.
@@ -248,7 +275,7 @@ def main():
                 d = (base_dir_vec * math.cos(a)
                      + torch.linalg.cross(axis, base_dir_vec) * math.sin(a)
                      + axis * torch.dot(axis, base_dir_vec) * (1. - math.cos(a)))
-                jobs.append((cam, light_pos, light_pos + reach * torch.nn.functional.normalize(d, dim=0),
+                jobs.append((cam, single_pos, single_pos + reach * torch.nn.functional.normalize(d, dim=0),
                              f"aim_{f:04d}"))
 
     # ---- Render ----
@@ -262,6 +289,9 @@ def main():
 
     with open(os.path.join(out_dir, "spotlight.txt"), "w") as f:
         f.write(spot.describe() + "\n\n" + ascii_profile(spot.fit) + "\n")
+    save_light_rig(os.path.join(out_dir, "spotlights.json"), "spot",
+                   spot.get_xyz, spot._intensity, directions=spot._direction,
+                   cutoff_deg=spot.cutoff_deg, sigma_deg=spot.sigma_deg)
     print(f"\nDone. {len(jobs)} render(s) in {out_dir}")
 
 
