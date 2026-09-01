@@ -10,6 +10,7 @@
 #
 
 import os
+import json
 import cv2
 import glob
 import imageio
@@ -98,6 +99,11 @@ if __name__ == "__main__":
     print("Rendering " + args.model_path)
 
     dataset = read_cfg(args.model_path)
+    training_options = {}
+    training_options_path = os.path.join(args.model_path, "training_options.json")
+    if os.path.exists(training_options_path):
+        with open(training_options_path, "r", encoding="utf-8") as handle:
+            training_options = json.load(handle)
 
     iteration, pipe = args.iteration, pipeline.extract(args)
     if args.lights_file and pipe.compute_cov3D_python:
@@ -119,7 +125,9 @@ if __name__ == "__main__":
         # training.  The default of 1 severely underexposes small scenes whose
         # cfg_args contains e.g. --max_inverse_falloff 100.
         "inverse_falloff_max": dataset.max_inverse_falloff,
-        "min_decay": getattr(dataset, "min_decay_final", 1e-4),
+        # Optimization parameters are written to training_options.json, not
+        # cfg_args.  Reuse the final training visibility threshold at inference.
+        "min_decay": training_options.get("min_decay_final", 1e-4),
         "use_cluster": not pipe.not_use_cluster,
     }
     
