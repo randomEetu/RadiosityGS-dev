@@ -255,15 +255,22 @@ class GaussianExtractor(object):
             self.viewpoint_stack.append(novel_view)
         
     @torch.no_grad()
-    def reconstructionGI(self, viewpoint_stack, ls, pipe, background, num_walks, clean_albedo=False, caching=False):
+    def reconstructionGI(self, viewpoint_stack, ls, pipe, background, num_walks,
+                         clean_albedo=False, caching=False, solver_settings=None):
         """
         reconstruct radiance field given cameras
         """
         self.clean(clean_albedo=clean_albedo)
         self.viewpoint_stack = viewpoint_stack
         cached_radiosities = None
+        solver_settings = dict(solver_settings or {})
+        solver_settings["num_walks"] = num_walks
         for i, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="reconstruct radiance fields"):
-            render_pkg = renderGI(viewpoint_cam, self.gaussians, ls.from_camera_if_possible(viewpoint_cam), pipe, background, override_solver_settings={"num_walks": num_walks}, override_radiosities=cached_radiosities)
+            render_pkg = renderGI(
+                viewpoint_cam, self.gaussians,
+                ls.from_camera_if_possible(viewpoint_cam), pipe, background,
+                override_solver_settings=solver_settings,
+                override_radiosities=cached_radiosities)
             cached_radiosities = render_pkg["radiosity"] if caching else None
             rgb = render_pkg['render']
             alpha = render_pkg['rend_alpha']
