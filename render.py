@@ -77,6 +77,8 @@ if __name__ == "__main__":
                         help="Split used by --single_view")
     parser.add_argument("--view_index", type=int, default=0,
                         help="Camera index used by --single_view (wraps modulo split size)")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Print light, checkpoint, solver, and raster tensor statistics")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--white", action="store_true")
     parser.add_argument("--caching", action="store_true")
@@ -117,6 +119,7 @@ if __name__ == "__main__":
         # training.  The default of 1 severely underexposes small scenes whose
         # cfg_args contains e.g. --max_inverse_falloff 100.
         "inverse_falloff_max": dataset.max_inverse_falloff,
+        "min_decay": getattr(dataset, "min_decay_final", 1e-4),
         "use_cluster": not pipe.not_use_cluster,
     }
     
@@ -155,7 +158,8 @@ if __name__ == "__main__":
         gaussExtractor.reconstruction(views)
         gaussExtractor.reconstructionGI(
             views, light_sources, pipe, background, args.num_walks,
-            caching=args.caching, solver_settings=solver_settings)
+            caching=args.caching, solver_settings=solver_settings,
+            diagnostics=args.diagnose)
         gaussExtractor.export_image(train_dir, enforce_bg=1. if args.white else None)
     
     if (not args.skip_test) and (len(scene.getTestCameras()) > 0):
@@ -178,7 +182,8 @@ if __name__ == "__main__":
         gaussExtractor.reconstruction(views)
         gaussExtractor.reconstructionGI(
             views, light_sources, pipe, background, args.num_walks,
-            caching=args.caching, solver_settings=solver_settings)
+            caching=args.caching, solver_settings=solver_settings,
+            diagnostics=args.diagnose)
         gaussExtractor.export_image(test_dir, enforce_bg=1. if args.white else None)
     
     if (not args.skip_novel):
@@ -218,7 +223,7 @@ if __name__ == "__main__":
                 gaussExtractor.reconstructionGI(
                     test_cameras, ls, pipe, background, args.num_walks,
                     clean_albedo=True, caching=args.caching,
-                    solver_settings=solver_settings)
+                    solver_settings=solver_settings, diagnostics=args.diagnose)
                 gaussExtractor.export_image(out_dir, enforce_bg=1. if args.white else None)
         
         if 'Synthetic4Relight' in dataset.source_path:
@@ -247,7 +252,7 @@ if __name__ == "__main__":
                 gaussExtractor.reconstructionGI(
                     test_cameras, ls, pipe, background, args.num_walks,
                     clean_albedo=True, caching=args.caching,
-                    solver_settings=solver_settings)
+                    solver_settings=solver_settings, diagnostics=args.diagnose)
                 gaussExtractor.export_image(out_dir, enforce_bg=1. if args.white else None)
     
     if not args.skip_mesh:

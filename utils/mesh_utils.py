@@ -256,7 +256,8 @@ class GaussianExtractor(object):
         
     @torch.no_grad()
     def reconstructionGI(self, viewpoint_stack, ls, pipe, background, num_walks,
-                         clean_albedo=False, caching=False, solver_settings=None):
+                         clean_albedo=False, caching=False, solver_settings=None,
+                         diagnostics=False):
         """
         reconstruct radiance field given cameras
         """
@@ -266,11 +267,45 @@ class GaussianExtractor(object):
         solver_settings = dict(solver_settings or {})
         solver_settings["num_walks"] = num_walks
         for i, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="reconstruct radiance fields"):
+            active_ls = ls.from_camera_if_possible(viewpoint_cam)
+            if diagnostics:
+                def summarize(name, value):
+                    value = value.detach()
+                    finite = torch.isfinite(value)
+                    if finite.any():
+                        samples = value[finite]
+                        print(
+                            f"[diagnose] {name}: shape={tuple(value.shape)} "
+                            f"finite={finite.float().mean().item():.6f} "
+                            f"min={samples.min().item():.8g} "
+                            f"mean={samples.mean().item():.8g} "
+                            f"max={samples.max().item():.8g} "
+                            f"nonzero={(samples != 0).float().mean().item():.6f}")
+                    else:
+                        print(f"[diagnose] {name}: shape={tuple(value.shape)} finite=0")
+
+                print(f"[diagnose] camera={viewpoint_cam.image_name} "
+                      f"center={viewpoint_cam.camera_center.detach().cpu().tolist()}")
+                print(f"[diagnose] solver_settings={solver_settings}")
+                summarize("gaussians.xyz", self.gaussians.get_xyz)
+                summarize("gaussians.scaling", self.gaussians.get_scaling)
+                summarize("gaussians.geovalue", self.gaussians.get_geovalue)
+                summarize("gaussians.diffuse_albedo", self.gaussians.get_real_diffuse_albedos)
+                summarize("gaussians.brdf", self.gaussians.get_brdf_coeffs)
+                summarize("gaussians.norm_factor", self.gaussians.get_norm_factor)
+                summarize("lights.xyz", active_ls.get_xyz)
+                summarize("lights.emissions", active_ls.get_emissions)
+                if viewpoint_cam.gt_alpha_mask is not None:
+                    summarize("camera.alpha", viewpoint_cam.gt_alpha_mask)
             render_pkg = renderGI(
                 viewpoint_cam, self.gaussians,
-                ls.from_camera_if_possible(viewpoint_cam), pipe, background,
+                active_ls, pipe, background,
                 override_solver_settings=solver_settings,
                 override_radiosities=cached_radiosities)
+            if diagnostics:
+                summarize("solver.radiosity", render_pkg["radiosity"])
+                summarize("raster.render", render_pkg["render"])
+                summarize("raster.alpha", render_pkg["rend_alpha"])
             cached_radiosities = render_pkg["radiosity"] if caching else None
             rgb = render_pkg['render']
             alpha = render_pkg['rend_alpha']
