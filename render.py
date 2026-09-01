@@ -71,6 +71,12 @@ if __name__ == "__main__":
     parser.add_argument("--skip_novel", action="store_true")
     parser.add_argument("--skip_mesh", action="store_true")
     parser.add_argument("--skip_metrics", action="store_true")
+    parser.add_argument("--single_view", action="store_true",
+                        help="Render only --view_index from --view_split")
+    parser.add_argument("--view_split", choices=["train", "test"], default="test",
+                        help="Split used by --single_view")
+    parser.add_argument("--view_index", type=int, default=0,
+                        help="Camera index used by --single_view (wraps modulo split size)")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--white", action="store_true")
     parser.add_argument("--caching", action="store_true")
@@ -115,11 +121,19 @@ if __name__ == "__main__":
     test_dir = os.path.join(args.model_path, 'test', "ours_{}{}".format(scene.loaded_iter, rig_suffix))
     novel_dir = os.path.join(args.model_path, 'novel', "ours_{}".format(scene.loaded_iter))
     gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)
+
+    if args.single_view:
+        # A single-view request selects the relevant split regardless of the
+        # broad --skip_train/--skip_test switches.
+        args.skip_train = args.view_split != "train"
+        args.skip_test = args.view_split != "test"
     
     if not args.skip_train:
         print("export training images ...")
         os.makedirs(train_dir, exist_ok=True)
         views = scene.getTrainCameras()
+        if args.single_view:
+            views = [views[args.view_index % len(views)]]
         if 'TensoIRSynthetic' in dataset.source_path:
             for view in views:
                 view.original_albedo_image = torch.from_numpy(
@@ -139,6 +153,8 @@ if __name__ == "__main__":
         print("export rendered testing images ...")
         os.makedirs(test_dir, exist_ok=True)
         views = scene.getTestCameras()
+        if args.single_view:
+            views = [views[args.view_index % len(views)]]
         if 'TensoIRSynthetic' in dataset.source_path:
             for view in views:
                 view.original_albedo_image = torch.from_numpy(

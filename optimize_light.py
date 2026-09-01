@@ -29,7 +29,8 @@ from tqdm import tqdm
 from scene import Scene
 from scene.gaussian_model import GaussianModel
 from scene.light_source import LightModel
-from scene.light_rig import save_light_rig
+from scene.local_light import LocalLightGeometry, point_emissions
+from scene.light_rig import load_light_rig, save_light_rig
 from scene.spot_light import LearnableSpotLights
 from gaussian_renderer import renderGI
 from arguments import PipelineParams, get_combined_args
@@ -41,7 +42,7 @@ from utils.sh_utils import RGB2SH, SH2RGB
 from render import read_cfg
 
 
-class LearnablePointLight:
+class LearnablePointLight(LocalLightGeometry):
     """A homogeneous batch of global, trainable point lights.
 
     Mirrors the interface that ``renderGI`` expects from a light-source object
@@ -83,32 +84,7 @@ class LearnablePointLight:
 
     @property
     def get_emissions(self):
-        # (N, (deg+1)^2, 3): only the DC band emits; higher bands are zero.
-        dc = self.get_dc[:, None, :]
-        n_rest = (self.max_sh_degree + 1) ** 2 - 1
-        rest = torch.zeros((len(self._xyz), n_rest, 3), dtype=dc.dtype, device=self._device)
-        return torch.cat((dc, rest), dim=1)
-
-    # --- fixed constants (match a per-camera point light) ---
-    @property
-    def get_geovalue(self):
-        return torch.full((len(self._xyz), 1), 6., device=self._device)
-
-    @property
-    def get_norm_factor(self):
-        return torch.ones((len(self._xyz), 1), device=self._device)
-
-    @property
-    def get_scaling(self):
-        return torch.tensor([1e-3, 1e-3], device=self._device)[None].repeat(len(self._xyz), 1)
-
-    @property
-    def get_rotation(self):
-        return torch.tensor([1., 0., 0., 0.], device=self._device)[None].repeat(len(self._xyz), 1)
-
-    @property
-    def get_is_light_source(self):
-        return torch.ones((len(self._xyz), 1), dtype=torch.bool, device=self._device)
+        return point_emissions(self.get_dc, self.max_sh_degree)
 
     def parameters(self):
         return [self._xyz, self._intensity]
@@ -163,6 +139,8 @@ def main():
                         help="Save a fixed-view render every N epochs (epoch 0 always saved)")
     parser.add_argument("--num_walks", type=int, default=64,
                         help="Monte-Carlo walks for the (hybrid/MC) solver")
+    parser.add_argument("--resolution_divisor", type=int, choices=[1, 2, 4, 8], default=1,
+                        help="Downsample optimization images by this factor for faster fitting")
     parser.add_argument("--position_lr", type=float, default=0.01)
     parser.add_argument("--intensity_lr", type=float, default=0.05,
                         help="LR for log-intensity (multiplicative: 0.05 ~= 5%%/step)")
@@ -192,6 +170,8 @@ def main():
                              "(can land behind the object => dead gradient => stays dark).")
     parser.add_argument("--init_dist_scale", type=float, default=2.0,
                         help="[sphere mode] Init light distance from object center, in object-radii")
+    parser.add_argument("--init_pos", type=float, nargs=3, action="append", default=None,
+                        help="Explicit initial world-space position; repeat once per light")
     parser.add_argument("--random_intensity", action="store_true",
                         help="Also randomize the initial intensity (default: seed it from the dataset mean)")
     parser.add_argument("--init_intensity", type=float, default=1.0,
@@ -200,11 +180,16 @@ def main():
                         help="Optimize against at most this many training views per epoch (-1 = all)")
     parser.add_argument("--output_dir", type=str, default="",
                         help="Where to write light_optimization/ (default: inside the model path)")
+    parser.add_argument("--gt_lights_file", type=str, default="",
+                        help="Render the single-target GT from this fixed light rig instead of using "
+                             "the dataset image; requires --target_view")
     parser.add_argument("--quiet", action="store_true")
     args = get_combined_args(parser)
 
     if args.num_lights < 1:
         parser.error("--num_lights must be at least 1")
+    if args.gt_lights_file and args.target_view < 0:
+        parser.error("--gt_lights_file requires --target_view")
 
     safe_state(args.quiet)
     torch.autograd.set_detect_anomaly(False)
@@ -213,6 +198,7 @@ def main():
 
     # ---- Load the trained scene (frozen) ----
     dataset = read_cfg(args.model_path)
+    dataset.resolution = args.resolution_divisor
     pipe = pipeline.extract(args)
     if pipe.compute_cov3D_python:
         raise SystemExit("[ABORT] --compute_cov3D_python is not supported for local light rigs.")
@@ -257,7 +243,15 @@ def main():
     center = gaussians.get_xyz.detach().mean(dim=0)
     obj_radius = (gaussians.get_xyz.detach() - center).norm(dim=1).max()
 
-    if args.init_mode == "dataset":
+    requested_init_pos = getattr(args, "init_pos", None)
+    if requested_init_pos is not None:
+        init_xyz = torch.tensor(requested_init_pos, dtype=torch.float32, device="cuda").reshape(-1, 3)
+        if len(init_xyz) == 1:
+            init_xyz = init_xyz.repeat(args.num_lights, 1)
+        if len(init_xyz) != args.num_lights:
+            parser.error("--init_pos must be given once or exactly --num_lights times")
+        effective_init_mode = "explicit --init_pos"
+    elif args.init_mode == "dataset":
         # Draw a random-but-plausible light from where the dataset's lights live.
         # Guarantees the light starts in front of / illuminating the object, so the
         # loss has a live gradient. The specific target light is still "forgotten".
@@ -267,10 +261,12 @@ def main():
         # gradients and remain permanently symmetric.
         pos_scale = torch.maximum(pos_std, torch.ones_like(pos_std) * obj_radius * 0.05)
         init_xyz = pos_mean[None] + torch.randn(args.num_lights, 3, device="cuda") * pos_scale[None]
+        effective_init_mode = "dataset"
     else:  # sphere
         direction = torch.randn(args.num_lights, 3, device="cuda")
         direction = direction / direction.norm(dim=1, keepdim=True)
         init_xyz = center[None] + direction * obj_radius * args.init_dist_scale
+        effective_init_mode = "sphere"
 
     if args.random_intensity:
         init_intensity_rgb = torch.rand(args.num_lights, 3, device="cuda") * args.init_intensity
@@ -298,7 +294,7 @@ def main():
             cutoff_deg=args.cutoff_deg, sigma_deg=args.sigma_deg,
             max_sh_degree=gaussians.max_sh_degree, fit_sh_degree=fit_degree,
             ridge=args.ridge)
-    print(f"\nInit mode: {args.init_mode}")
+    print(f"\nInit mode: {effective_init_mode}")
     initial_rgb = SH2RGB(lights.get_dc.detach()) if args.light_type == "point" else lights.get_intensity.detach()
     for i, (pos, rgb) in enumerate(zip(lights._xyz.detach(), initial_rgb)):
         print(f"Initial light[{i}] position: {pos.tolist()} | RGB: {rgb.tolist()}")
@@ -355,7 +351,17 @@ def main():
     print(f"Writing snapshots to: {out_dir}\n")
 
     # Save the ground-truth of the fixed view once, as the convergence target.
-    fixed_gt = gt_of(fixed_cam).clamp(0., 1.)
+    if args.gt_lights_file:
+        gt_lights = load_light_rig(
+            args.gt_lights_file, max_sh_degree=gaussians.max_sh_degree,
+            fit_sh_degree=gaussians.active_sh_degree, device="cuda")
+        with torch.no_grad():
+            fixed_gt = renderGI(
+                fixed_cam, gaussians, gt_lights, pipe, background,
+                override_solver_settings=solver_settings)["render"].clamp(0., 1.)
+        print(f"Synthetic GT light rig: {args.gt_lights_file}")
+    else:
+        fixed_gt = gt_of(fixed_cam).clamp(0., 1.)
     save_img_u8(fixed_gt.permute(1, 2, 0).cpu().numpy(),
                 os.path.join(out_dir, "gt_reference.png"))
 
@@ -416,7 +422,7 @@ def main():
                            override_solver_settings=solver_settings)
             image = pkg["render"]
 
-            gt = gt_of(cam)
+            gt = fixed_gt if args.gt_lights_file else gt_of(cam)
             mask = alpha_of(cam, gt)
             image = image * mask  # compare on the masked object region
             gt = gt * mask

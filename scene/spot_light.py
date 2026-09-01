@@ -59,6 +59,7 @@ import math
 
 import torch
 
+from scene.local_light import LocalLightGeometry
 from utils.sh_utils import eval_sh, eval_sh_response
 
 
@@ -211,7 +212,7 @@ def quat_from_z_to(direction: torch.Tensor) -> torch.Tensor:
     return (q / q.norm()).float()
 
 
-class SpotLight:
+class SpotLight(LocalLightGeometry):
     """A homogeneous batch of point lights with cone-shaped emission profiles.
 
     Duck-types the light-source object ``renderGI`` expects (the same interface as
@@ -280,10 +281,6 @@ class SpotLight:
 
     # --- aiming ---
     @property
-    def get_xyz(self):
-        return self._xyz
-
-    @property
     def get_rotation(self):
         return torch.stack([quat_from_z_to(d) for d in self._direction]).to(self._device)
 
@@ -314,23 +311,6 @@ class SpotLight:
         # the RGB radiance gives `spot_factor(theta) * intensity` on evaluation.
         return (self._profile[:, :, None] * self._intensity[:, None, :]).contiguous()
 
-    # --- fixed constants (match a per-camera point light) ---
-    @property
-    def get_geovalue(self):
-        return torch.full((len(self._xyz), 1), 6., device=self._device)
-
-    @property
-    def get_norm_factor(self):
-        return torch.ones((len(self._xyz), 1), device=self._device)
-
-    @property
-    def get_scaling(self):
-        return torch.tensor([1e-3, 1e-3], device=self._device)[None].repeat(len(self._xyz), 1)
-
-    @property
-    def get_is_light_source(self):
-        return torch.ones((len(self._xyz), 1), dtype=torch.bool, device=self._device)
-
     def from_camera_if_possible(self, camera):
         return self
 
@@ -350,7 +330,7 @@ class SpotLight:
         return "\n".join(lines)
 
 
-class LearnableSpotLights:
+class LearnableSpotLights(LocalLightGeometry):
     """A trainable homogeneous spotlight batch.
 
     Positions, orientations, and log-RGB intensities are parameters. Cone shape
@@ -385,10 +365,6 @@ class LearnableSpotLights:
             torch.log(fixed._intensity.detach().clone().clamp_min(1e-8)))
 
     @property
-    def get_xyz(self):
-        return self._xyz
-
-    @property
     def get_rotation(self):
         return torch.nn.functional.normalize(self._rotation, dim=1)
 
@@ -408,22 +384,6 @@ class LearnableSpotLights:
     @property
     def get_emissions(self):
         return (self._profile[:, :, None] * self.get_intensity[:, None, :]).contiguous()
-
-    @property
-    def get_geovalue(self):
-        return torch.full((len(self._xyz), 1), 6., device=self._device)
-
-    @property
-    def get_norm_factor(self):
-        return torch.ones((len(self._xyz), 1), device=self._device)
-
-    @property
-    def get_scaling(self):
-        return torch.tensor([1e-3, 1e-3], device=self._device)[None].repeat(len(self._xyz), 1)
-
-    @property
-    def get_is_light_source(self):
-        return torch.ones((len(self._xyz), 1), dtype=torch.bool, device=self._device)
 
     def parameters(self):
         return [self._xyz, self._rotation, self._log_intensity]

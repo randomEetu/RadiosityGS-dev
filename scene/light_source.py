@@ -3,6 +3,7 @@ from torch import nn
 from dnnlib import EasyDict
 from submodules.env_map_sampler import *
 from utils.sh_utils import RGB2SH, SH2RGB
+from scene.local_light import LocalLightGeometry, point_emissions
 
 class LightModel:
     def __init__(self, dataset):
@@ -96,7 +97,7 @@ class LightModel:
             return self
 
 
-class PointLights:
+class PointLights(LocalLightGeometry):
     """A fixed, homogeneous batch of local point lights.
 
     ``renderGI`` consumes light sources as tensors whose leading dimension is
@@ -137,31 +138,7 @@ class PointLights:
 
     @property
     def get_emissions(self):
-        dc = self._intensity[:, None, :]
-        rest = torch.zeros(
-            (len(self._xyz), (self.max_sh_degree + 1) ** 2 - 1, 3),
-            dtype=dc.dtype, device=dc.device)
-        return torch.cat((dc, rest), dim=1)
-
-    @property
-    def get_scaling(self):
-        return torch.tensor([1e-3, 1e-3], device=self._device)[None].repeat(len(self._xyz), 1)
-
-    @property
-    def get_rotation(self):
-        return torch.tensor([1., 0., 0., 0.], device=self._device)[None].repeat(len(self._xyz), 1)
-
-    @property
-    def get_geovalue(self):
-        return torch.full((len(self._xyz), 1), 6., device=self._device)
-
-    @property
-    def get_norm_factor(self):
-        return torch.ones((len(self._xyz), 1), device=self._device)
-
-    @property
-    def get_is_light_source(self):
-        return torch.ones((len(self._xyz), 1), dtype=torch.bool, device=self._device)
+        return point_emissions(self._intensity, self.max_sh_degree)
 
     def from_camera_if_possible(self, camera):
         """Keep this explicit rig fixed instead of substituting camera metadata."""
