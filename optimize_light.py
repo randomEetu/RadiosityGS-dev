@@ -151,6 +151,10 @@ def main():
                         help="If >=0, optimize the light to reproduce a SINGLE train view "
                              "(index into the train split). This view is also the snapshot "
                              "camera and gt_reference. Recommended for OLAT/multi-light data.")
+    parser.add_argument("--target_views", type=int, nargs="+", default=None,
+                        help="Optimize one light rig against several train views. This is the "
+                             "multi-view counterpart of --target_view and supports "
+                             "--gt_lights_file.")
     parser.add_argument("--steps_per_epoch", type=int, default=-1,
                         help="Gradient steps per epoch. Default: all train views (multi-view), "
                              "or 50 (single-target mode).")
@@ -188,8 +192,12 @@ def main():
 
     if args.num_lights < 1:
         parser.error("--num_lights must be at least 1")
-    if args.gt_lights_file and args.target_view < 0:
-        parser.error("--gt_lights_file requires --target_view")
+    requested_target_views = getattr(args, "target_views", None)
+    if requested_target_views and args.target_view >= 0:
+        parser.error("use either --target_view or --target_views, not both")
+    target_mode_requested = args.target_view >= 0 or bool(requested_target_views)
+    if args.gt_lights_file and not target_mode_requested:
+        parser.error("--gt_lights_file requires --target_view or --target_views")
 
     safe_state(args.quiet)
     torch.autograd.set_detect_anomaly(False)
@@ -234,7 +242,7 @@ def main():
         print(f"Dataset pl_pos  std  = {pos_std.tolist()}  "
               f"(near-zero std => a single global light; large std => per-view/OLAT lights)")
         obj_radius_hint = (gaussians.get_xyz.detach() - gaussians.get_xyz.detach().mean(0)).norm(dim=1).max()
-        if pos_std.max() > 0.1 * obj_radius_hint and args.target_view < 0:
+        if pos_std.max() > 0.1 * obj_radius_hint and not target_mode_requested:
             print("\n[WARNING] Light position varies a lot across views => this looks like a")
             print("          OLAT dataset. One fixed global light rig cannot fit all")
             print("          views and will drift. Re-run with --target_view <i> to fit ONE image.\n")
@@ -325,12 +333,18 @@ def main():
     # ---- Fixed camera for the snapshots ----
     # In single-target mode the snapshot view IS the target, so the render should
     # converge to exactly reproduce gt_reference.png.
-    target_mode = args.target_view >= 0
+    target_mode = target_mode_requested
     if target_mode:
-        target_idx = args.target_view % len(train_cams)
+        raw_target_indices = (requested_target_views if requested_target_views
+                              else [args.target_view])
+        # Preserve CLI order while avoiding accidental duplicate supervision.
+        target_indices = list(dict.fromkeys(
+            index % len(train_cams) for index in raw_target_indices))
+        target_idx = target_indices[0]
         fixed_cam = train_cams[target_idx]
-        split_name = f"train (single-target #{target_idx})"
-        print(f"\nSingle-target mode: fitting the light to train[{target_idx}] "
+        split_name = "train targets " + ",".join(str(index) for index in target_indices)
+        print(f"\nTarget-view mode: fitting one light rig to train views {target_indices}")
+        print(f"Fixed snapshot camera: train[{target_idx}] "
               f"(image_name={fixed_cam.image_name})")
     else:
         if args.view_split == "test" or (args.view_split == "auto" and len(test_cams) > 0):
@@ -351,29 +365,52 @@ def main():
     print(f"Writing snapshots to: {out_dir}\n")
 
     # Save the ground-truth of the fixed view once, as the convergence target.
+    target_gts = {}
     if args.gt_lights_file:
         gt_lights = load_light_rig(
             args.gt_lights_file, max_sh_degree=gaussians.max_sh_degree,
             fit_sh_degree=gaussians.active_sh_degree, device="cuda")
         with torch.no_grad():
-            fixed_gt = renderGI(
-                fixed_cam, gaussians, gt_lights, pipe, background,
-                override_solver_settings=solver_settings)["render"].clamp(0., 1.)
+            for index in target_indices:
+                target_gts[index] = renderGI(
+                    train_cams[index], gaussians, gt_lights, pipe, background,
+                    override_solver_settings=solver_settings)["render"].clamp(0., 1.)
+        fixed_gt = target_gts[target_idx]
         print(f"Synthetic GT light rig: {args.gt_lights_file}")
+    elif target_mode:
+        target_gts = {index: gt_of(train_cams[index]).clamp(0., 1.)
+                      for index in target_indices}
+        fixed_gt = target_gts[target_idx]
     else:
         fixed_gt = gt_of(fixed_cam).clamp(0., 1.)
     save_img_u8(fixed_gt.permute(1, 2, 0).cpu().numpy(),
                 os.path.join(out_dir, "gt_reference.png"))
+    if len(target_gts) > 1:
+        for index, target_gt in target_gts.items():
+            save_img_u8(target_gt.permute(1, 2, 0).cpu().numpy(),
+                        os.path.join(out_dir, f"gt_reference_view_{index}.png"))
 
     @torch.no_grad()
     def save_snapshot(epoch):
-        pkg = renderGI(fixed_cam, gaussians, lights, pipe, background,
-                       override_solver_settings=solver_settings)
-        img = pkg["render"].clamp(0., 1.)
-        save_img_u8(img.permute(1, 2, 0).cpu().numpy(),
-                    os.path.join(out_dir, f"epoch_{epoch}.png"))
-        p = psnr(img, fixed_gt).mean().item()
-        print(f"[epoch {epoch:>3}] saved epoch_{epoch}.png | fixed-view PSNR {p:5.2f}")
+        if target_mode and len(target_indices) > 1:
+            snapshot_views = [(index, train_cams[index], target_gts[index])
+                              for index in target_indices]
+        else:
+            snapshot_views = [(None, fixed_cam, fixed_gt)]
+        scores = []
+        filenames = []
+        for index, camera, reference in snapshot_views:
+            pkg = renderGI(camera, gaussians, lights, pipe, background,
+                           override_solver_settings=solver_settings)
+            img = pkg["render"].clamp(0., 1.)
+            filename = (f"epoch_{epoch}.png" if index is None
+                        else f"epoch_{epoch}_view_{index}.png")
+            save_img_u8(img.permute(1, 2, 0).cpu().numpy(),
+                        os.path.join(out_dir, filename))
+            scores.append(psnr(img, reference).mean().item())
+            filenames.append(filename)
+        print(f"[epoch {epoch:>3}] saved {', '.join(filenames)} | "
+              f"mean snapshot PSNR {sum(scores) / len(scores):5.2f}")
         current_rgb = SH2RGB(lights.get_dc.detach()) if args.light_type == "point" else lights.get_intensity.detach()
         for i, (pos, rgb) in enumerate(zip(lights._xyz.detach(), current_rgb)):
             print(f"  light[{i}] pos [{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}] | "
@@ -409,7 +446,10 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         if target_mode:
-            batch = [target_idx] * steps
+            # Balanced supervision even when steps is not divisible by the
+            # number of target cameras; shuffle their order between epochs.
+            batch = [target_indices[i % len(target_indices)] for i in range(steps)]
+            random.shuffle(batch)
         else:
             order = list(range(len(train_cams)))
             random.shuffle(order)
@@ -422,7 +462,7 @@ def main():
                            override_solver_settings=solver_settings)
             image = pkg["render"]
 
-            gt = fixed_gt if args.gt_lights_file else gt_of(cam)
+            gt = target_gts[idx] if target_mode else gt_of(cam)
             mask = alpha_of(cam, gt)
             image = image * mask  # compare on the masked object region
             gt = gt * mask
