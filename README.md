@@ -19,7 +19,7 @@ conda activate radiosity_gs
 ./install.sh
 ```
 
-## Getting started (git test modification + more testing)
+## Getting started
 ### Dataset Preparation
 We currently only support the format as specified in [GS^3](https://github.com/gsrelight/gs-relight) where the location and intensity of point lights are provided, or the standard Blender/COLMAP format where a fixed environment map is assumed.
 
@@ -72,50 +72,6 @@ radiosity = render_pkg['radiosity']
 renderGI(viewpoint_cam, gaussians, light_sources, ..., override_radiosities=radiosity)
 ```
 
-### Multiple local lights
-
-Point-light and spotlight rigs may contain any number of lights, as long as all
-lights in a rig have the same type. Optimize two point lights and render the
-saved result with:
-
-```bash
-python optimize_light.py -m output/50_Hotdog --light_type point --num_lights 2 --target_view 0
-python render.py -m output/50_Hotdog --lights_file output/50_Hotdog/light_optimization/<run>/point_lights.json --skip_novel --skip_mesh
-```
-
-For trainable spotlights, position, aim direction, and intensity are optimized;
-the cone shape is fixed:
-
-```bash
-python optimize_light.py -m output/50_Hotdog --light_type spot --num_lights 2 \
-    --cutoff_deg 20 --sigma_deg 12 --target_view 0
-```
-
-To place multiple fixed spotlights, repeat the per-light arguments:
-
-```bash
-python relight_spotlight.py -m output/50_Hotdog --num_lights 2 \
-    --light_pos 2 1 3 --target 0 0 0 --intensity 10 8 6 \
-    --light_pos -2 1 3 --target 0 0 0 --intensity 6 8 10 --all_views
-```
-
-Both optimization and spotlight relighting write a JSON light rig. A rig can
-also be authored by hand using this shape:
-
-```json
-{
-  "type": "point",
-  "lights": [
-    {"position": [2, 1, 3], "intensity": [10, 8, 6]},
-    {"position": [-2, 1, 3], "intensity": [6, 8, 10]}
-  ]
-}
-```
-
-Spot entries use `"type": "spot"` at the top level and additionally contain
-`direction` (or `target`), `cutoff_deg`, and `sigma_deg`. Mixed point/spot rigs
-are rejected explicitly.
-
 ## Full Evaluation
 ### Dataset Preparation
 We provide our sparse-view relighting dataset at [here](https://ucsdcloud-my.sharepoint.com/:u:/g/personal/k1jiang_ucsd_edu/IQA_85ZN9DbPSK3RqAOzmmR7AdKNhQHbqlB6kBqPZP6r7ss?e=cR5SIt). Stanford-ORB dataset can be found at [here](https://github.com/StanfordORB/Stanford-ORB). We have re-implemented the algorithm for improved efficiency, which has slightly impacted performance compared to the original paper. The re-implemented codebase is optimized towards sparse-view relighting, while slightly affecting the performance on Stanford-ORB dataset.
@@ -126,6 +82,7 @@ For sparse-view relighting, please use the following command:
 ```bash
 python scripts/view_synthesis_eval.py --dataset <path to the sparse-view relighting dataset>
 ```
+
 <details>
 <summary><span style="font-weight: bold;">Table Results</span></summary>
 
@@ -167,3 +124,86 @@ Besides [GFSGS](https://github.com/RaymondJiangkw/GFSGS) and [2DGS](https://gith
   month   = {December}
 }
 ```
+
+## Local extensions in this fork
+
+The README content above is from the RadiosityGS authors. This section
+documents functionality added in this fork.
+
+### Local-light rigs and fitting
+
+This fork adds fixed and trainable **point-light** and **spotlight** rigs. A
+rig may contain any number of lights, provided every light has the same type.
+Use `optimize_light.py` to fit a frozen trained scene to one or more local
+lights. For OLAT datasets, fit a single image with `--target_view` because
+each image can have a different input light.
+
+```bash
+# Fit two point lights and render the saved rig.
+python optimize_light.py -m output/50_Hotdog --light_type point --num_lights 2 --target_view 0
+python render.py -m output/50_Hotdog \
+    --lights_file output/50_Hotdog/light_optimization/<run>/point_lights.json \
+    --skip_novel --skip_mesh
+
+# Fit two spotlights. Their cone cutoff and falloff are fixed during fitting.
+python optimize_light.py -m output/50_Hotdog --light_type spot --num_lights 2 \
+    --cutoff_deg 20 --sigma_deg 12 --target_view 0
+```
+
+Use `relight_spotlight.py` to place and render fixed spotlights. Repeat each
+per-light option for multiple lights:
+
+```bash
+python relight_spotlight.py -m output/50_Hotdog --num_lights 2 \
+    --light_pos 2 1 3 --target 0 0 0 --intensity 10 8 6 \
+    --light_pos -2 1 3 --target 0 0 0 --intensity 6 8 10 --all_views
+```
+
+Both workflows write a human-readable JSON rig; `render.py --lights_file`
+loads it. Intensities are linear RGB:
+
+```json
+{
+  "type": "point",
+  "lights": [
+    {"position": [2, 1, 3], "intensity": [10, 8, 6]},
+    {"position": [-2, 1, 3], "intensity": [6, 8, 10]}
+  ]
+}
+```
+
+For spotlights, use `"type": "spot"` and add `direction` (or `target`),
+`cutoff_deg`, and `sigma_deg` to each light. Mixed point/spot rigs are not
+supported. Spotlights are represented with band-limited spherical harmonics,
+so very narrow cones are necessarily softer than their requested shape.
+
+### Creating Blender datasets
+
+`scripts/render_blender_radiositygs.py` renders a Blender scene into the
+GS^3-compatible HDR dataset format used here. It normalizes the scene to the
+unit cube, removes unmodelled illumination, and stores per-frame point-light
+metadata. Run it through Blender (not CPython):
+
+```bash
+blender -b ~/data/Cycles.blend --python scripts/render_blender_radiositygs.py -- \
+    --output ~/data/Cycles_radiositygs
+```
+
+Useful options include `--layout cornell` for Cornell-box camera/light
+placement, `--train-views`, `--test-views`, `--resolution`, `--samples`, and
+`--dry-run` to inspect normalization without rendering.
+
+### Depth-backed point initialization
+
+For synthetic Blender scenes, `scripts/render_blender_depth_init.py` can
+render depth maps for an existing generated dataset and back-project them into
+`points3d.ply`. This is optional geometry-assisted initialization, not an
+image-only/SfM baseline:
+
+```bash
+blender -b ~/data/Cycles.blend --python scripts/render_blender_depth_init.py -- \
+    --dataset ~/data/Cycles_radiositygs
+```
+
+Use `--points-per-view`, `--max-views`, and `--resolution` to control the
+initializer. The source `.blend` file is not modified by either Blender tool.
